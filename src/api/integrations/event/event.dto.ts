@@ -1,5 +1,5 @@
 import { Constructor } from '@api/integrations/integration.dto';
-import { JsonValue } from '@prisma/client/runtime/library';
+import { JsonValue } from '@prisma/client/runtime/client';
 
 export class EventDto {
   webhook?: {
