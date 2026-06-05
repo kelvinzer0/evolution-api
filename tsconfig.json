@@ -1,11 +1,10 @@
 {
   "compilerOptions": {
-    "ignoreDeprecations": "6.0",
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "declaration": true,
     "target": "es2020",
-    "module": "CommonJS",
+    "module": "preserve",
     "rootDir": "./",
     "resolveJsonModule": true,
     "removeComments": true,
@@ -18,7 +17,6 @@
     "strictNullChecks": false,
     "incremental": true,
     "noImplicitAny": false,
-    "baseUrl": ".",
     "paths": {
       "@api/*": ["./src/api/*"],
       "@cache/*": ["./src/cache/*"],
@@ -28,7 +26,7 @@
       "@utils/*": ["./src/utils/*"],
       "@validate/*": ["./src/validate/*"]
     },
-    "moduleResolution": "Node"
+    "moduleResolution": "bundler"
   },
   "exclude": ["node_modules", "./test", "./dist", "./prisma"],
   "include": [
