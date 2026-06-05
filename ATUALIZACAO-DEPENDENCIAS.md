@@ -59,9 +59,27 @@ amqplib 2.0 (manter callback_api).
 4. Redis 4→6: `src/cache/rediscache.ts` (`exists()` retorna número).
 5. TypeScript 5→6: `tsc --noEmit` + tsup.
 
-### TIER 4 — Prisma 6→7 (spike opcional, NÃO bloqueante)
-Manter 6.19.x como estado estável entregue. Avaliar Prisma 7 em branch `spike/prisma-7`
-(adapter-pg + `prisma.config.ts`, validar multi-provider/CommonJS). Só promover se passar em todos os testes.
+### TIER 3f — moduleResolution moderno + proxy agents (CONCLUÍDO)
+- `tsconfig`: `module: preserve` + `moduleResolution: bundler`; **removidos `baseUrl` e `ignoreDeprecations`**
+  (dívida de deprecação do TS 6/7 eliminada por completo). Paths resolvem relativo ao tsconfig (tsc/tsup/tsx).
+- `https-proxy-agent` 7→9 e `socks-proxy-agent` 8→10 (majors ESM-only, agora resolvíveis).
+- Validado: tsc/lint/build + boot do `dev:server` carregando todos os módulos.
+
+### TIER 4 — Prisma 6→7 (CONCLUÍDO — driver adapters + prisma-client)
+Migração estrutural completa e validada (dev + produção):
+- `prisma`/`@prisma/client` **7.8.0** + `@prisma/adapter-pg` + `@prisma/adapter-mariadb`.
+- generator `prisma-client-js` → `prisma-client` com `output ./generated/client` (TS gerado) nos 3 schemas;
+  `url` removida do datasource (proibida no v7).
+- `prisma.config.ts`: connection string (`DATABASE_CONNECTION_URI`) + seleção dinâmica de schema/migrations
+  por `DATABASE_PROVIDER` (multi-provider postgresql/mysql/psql_bouncer).
+- `repository.service.ts`: instancia `PrismaClient` com driver adapter conforme provider.
+- Alias `@prisma/client` → client gerado no tsconfig (tsx/tsc) **e** no tsup (`noExternal` + esbuild alias),
+  pois o esbuild não honra `paths` do tsconfig.
+- `tsup`: `shims: true` (shim de `import.meta.url` p/ o client v7 no bundle CJS) + `platform: node`.
+- `start:prod` usa `dist/main.js` (CJS); o ESM puro quebra por imports sem extensão do `@figuro/chatwoot-sdk`.
+- `prisma/generated/` no `.gitignore` (gerado por provider via `db:generate`).
+- **Validado:** `db:generate` (postgres+mysql), tsc, lint, build, e boot **dev (tsx) + produção (`node dist/main.js`,
+  HTTP ON:3210)** até a query real (`DriverAdapterError: AuthenticationFailed` = credenciais/infra, não código).
 
 ## Verificação end-to-end
 
@@ -89,8 +107,9 @@ Smoke test de envio real (a partir do Tier 0):
 ### Mantidos na faixa do peer do Baileys rc13 (não subir sem o Baileys subir junto)
 `audio-decode@2`, `link-preview-js@3`, `pino@9`, `jimp@1.6` — peers `peerOptional` do Baileys; subir gera ERESOLVE e risco de quebrar áudio/preview internos.
 
-### Adiados (exigiriam migração de `moduleResolution`, alto risco de quebrar imports)
-`https-proxy-agent@9`, `socks-proxy-agent@10` — majors ESM-only com `exports` que o `moduleResolution: node10` atual não resolve. Mantidos em 7/8. Migrar junto com a modernização de módulos (TS 7 / node16|bundler).
+### ~~Adiados~~ → CONCLUÍDOS (Tier 3f)
+`https-proxy-agent@9`, `socks-proxy-agent@10` foram subidos após migrar `moduleResolution` para `bundler`.
+A dívida de `moduleResolution`/`baseUrl` (TS 7) foi eliminada.
 
 ### Correção crítica de runtime — `whatsapp-rust-bridge` (override)
 O Baileys rc13 passou a depender de `whatsapp-rust-bridge@0.5.4`, cujo `package.json` é ESM-only
