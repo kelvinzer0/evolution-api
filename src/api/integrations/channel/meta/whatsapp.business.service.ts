@@ -75,7 +75,7 @@ export class BusinessStartupService extends ChannelStartupService {
     return message.document || message.image || message.audio || message.video;
   }
 
-  private async post(message: any, params: string) {
+  protected async post(message: any, params: string) {
     try {
       let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
       const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
@@ -127,20 +127,100 @@ export class BusinessStartupService extends ChannelStartupService {
     if (!data) return;
 
     const content = data.entry[0].changes[0].value;
+    const normalizedContent = this.normalizeWebhookContent(content);
+    const remoteId = this.resolveRemoteId(normalizedContent);
 
     try {
       this.loadChatwoot();
 
-      this.eventHandler(content);
+      await this.eventHandler(normalizedContent);
 
-      this.phoneNumber = createJid(content.messages ? content.messages[0].from : content.statuses[0]?.recipient_id);
+      if (remoteId) {
+        this.phoneNumber = createJid(remoteId);
+      }
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
   }
 
-  private async downloadMediaMessage(message: any) {
+  private normalizeWebhookContent(content: any) {
+    if (!content || typeof content !== 'object') return content;
+
+    const normalized = { ...content };
+    const messageEchoes = Array.isArray(normalized?.message_echoes) ? normalized.message_echoes : undefined;
+    const smbMessageEchoes = Array.isArray(normalized?.smb_message_echoes) ? normalized.smb_message_echoes : undefined;
+    const echoes = messageEchoes?.length ? messageEchoes : smbMessageEchoes?.length ? smbMessageEchoes : undefined;
+
+    if (!Array.isArray(normalized.messages) && Array.isArray(echoes) && echoes.length > 0) {
+      normalized.messages = echoes;
+    }
+
+    return normalized;
+  }
+
+  private normalizePhoneNumber(value?: string) {
+    return typeof value === 'string' ? value.replace(/\D/g, '') : '';
+  }
+
+  private resolveRemoteId(content: any) {
+    const firstMessage = content?.messages?.[0];
+    const recipient = content?.statuses?.[0]?.recipient_id;
+
+    const candidates = [firstMessage?.from, firstMessage?.to, recipient].filter(Boolean) as string[];
+    if (candidates.length === 0) return undefined;
+
+    const businessNumbers = [
+      this.normalizePhoneNumber(content?.metadata?.display_phone_number),
+      this.normalizePhoneNumber(content?.metadata?.phone_number_id),
+    ].filter(Boolean);
+
+    const externalCounterpart = candidates.find((candidate) => {
+      const normalizedCandidate = this.normalizePhoneNumber(candidate);
+      return normalizedCandidate && !businessNumbers.includes(normalizedCandidate);
+    });
+
+    return externalCounterpart ?? candidates[0];
+  }
+
+  private isCloudApiEchoPayload(received: any) {
+    return (
+      (Array.isArray(received?.message_echoes) && received.message_echoes.length > 0) ||
+      (Array.isArray(received?.smb_message_echoes) && received.smb_message_echoes.length > 0)
+    );
+  }
+
+  private resolveMessageRemoteId(message: any, received: any) {
+    if (this.isCloudApiEchoPayload(received)) {
+      return message?.to ?? message?.from;
+    }
+
+    return message?.from ?? message?.to;
+  }
+
+  private isCloudApiFromMe(message: any, received: any) {
+    if (this.isCloudApiEchoPayload(received)) return true;
+
+    const from = this.normalizePhoneNumber(message?.from);
+    const displayPhone = this.normalizePhoneNumber(received?.metadata?.display_phone_number);
+    const phoneNumberId = this.normalizePhoneNumber(received?.metadata?.phone_number_id);
+
+    if (!from) return false;
+
+    return from === displayPhone || from === phoneNumberId;
+  }
+
+  private isCloudApiStatusFromMe(item: any, received: any) {
+    const recipient = this.normalizePhoneNumber(item?.recipient_id);
+    if (!recipient) return true;
+
+    const displayPhone = this.normalizePhoneNumber(received?.metadata?.display_phone_number);
+    const phoneNumberId = this.normalizePhoneNumber(received?.metadata?.phone_number_id);
+
+    return recipient !== displayPhone && recipient !== phoneNumberId;
+  }
+
+  protected async downloadMediaMessage(message: any) {
     try {
       const id = message[message.type].id;
       let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
@@ -162,6 +242,24 @@ export class BusinessStartupService extends ChannelStartupService {
       this.logger.error(`Error downloading media: ${e}`);
       throw e;
     }
+  }
+
+  // Transporte de download de mídia (metadata + binário) isolado num único ponto.
+  // A subclass EvoHub sobrescreve este helper para apontar a {HUB}/meta/${id}.
+  // Retorna `result` (metadata/headers da 1ª chamada) e `buffer` (arraybuffer da 2ª).
+  protected async fetchMediaFromGraph(id: string): Promise<{ result: any; buffer: any }> {
+    let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
+    const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
+    urlServer = `${urlServer}/${version}/${id}`;
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
+
+    const result = await axios.get(urlServer, { headers });
+    const buffer = await axios.get(result.data.url, {
+      headers: { Authorization: `Bearer ${this.token}` },
+      responseType: 'arraybuffer',
+    });
+
+    return { result, buffer };
   }
 
   private messageMediaJson(received: any) {
@@ -386,16 +484,30 @@ export class BusinessStartupService extends ChannelStartupService {
     try {
       let messageRaw: any;
       let pushName: any;
+      const incomingContact = received?.contacts?.[0];
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      if (incomingContact) {
+        pushName = incomingContact?.profile?.name ?? incomingContact?.name ?? incomingContact?.wa_id ?? undefined;
+      }
 
       if (received.messages) {
-        const message = received.messages[0]; // Añadir esta línea para definir message
+        const message = received.messages[0];
+        const remoteId = this.resolveMessageRemoteId(message, received);
+        if (!remoteId) return;
+
+        const remoteJid = createJid(remoteId);
+        const contact = await this.prismaRepository.contact.findFirst({
+          where: { instanceId: this.instanceId, remoteJid },
+        });
+
+        if (!pushName) {
+          pushName = contact?.pushName ?? incomingContact?.user_id ?? incomingContact?.wa_id ?? undefined;
+        }
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
-          fromMe: message.from === received.metadata.phone_number_id,
+          remoteJid,
+          fromMe: this.isCloudApiFromMe(message, received),
         };
 
         if (message.type === 'sticker') {
@@ -437,16 +549,7 @@ export class BusinessStartupService extends ChannelStartupService {
                 this.logger.warn('Message detected as media but contains no valid media content');
               } else {
                 const id = message.messages[0][message.messages[0].type].id;
-                let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
-                const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
-                urlServer = `${urlServer}/${version}/${id}`;
-                const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
-                const result = await axios.get(urlServer, { headers });
-
-                const buffer = await axios.get(result.data.url, {
-                  headers: { Authorization: `Bearer ${this.token}` }, // Use apenas o token de autorização para download
-                  responseType: 'arraybuffer',
-                });
+                const { result, buffer } = await this.fetchMediaFromGraph(id);
 
                 let mediaType;
 
@@ -698,12 +801,11 @@ export class BusinessStartupService extends ChannelStartupService {
           });
         }
 
-        const contact = await this.prismaRepository.contact.findFirst({
-          where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
-        });
+        const contactPhone = incomingContact?.profile?.phone ?? incomingContact?.wa_id ?? remoteId;
+        if (!contactPhone) return;
 
         const contactRaw: any = {
-          remoteJid: received.contacts[0].profile.phone,
+          remoteJid: createJid(contactPhone),
           pushName,
           // profilePicUrl: '',
           instanceId: this.instanceId,
@@ -715,7 +817,7 @@ export class BusinessStartupService extends ChannelStartupService {
 
         if (contact) {
           const contactRaw: any = {
-            remoteJid: received.contacts[0].profile.phone,
+            remoteJid: createJid(contactPhone),
             pushName,
             // profilePicUrl: '',
             instanceId: this.instanceId,
@@ -746,10 +848,13 @@ export class BusinessStartupService extends ChannelStartupService {
       }
       if (received.statuses) {
         for await (const item of received.statuses) {
-          const key = {
+          const remoteId = item?.recipient_id ?? this.phoneNumber;
+          if (!remoteId) continue;
+
+          const key: any = {
             id: item.id,
-            remoteJid: this.phoneNumber,
-            fromMe: this.phoneNumber === received.metadata.phone_number_id,
+            remoteJid: createJid(remoteId),
+            fromMe: this.isCloudApiStatusFromMe(item, received),
           };
           if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
             return;
@@ -767,6 +872,14 @@ export class BusinessStartupService extends ChannelStartupService {
 
             if (!findMessage) {
               return;
+            }
+
+            const findMessageKey: any = findMessage?.key ?? {};
+            if (findMessageKey?.remoteJid) {
+              key.remoteJid = findMessageKey.remoteJid;
+            }
+            if (typeof findMessageKey?.fromMe === 'boolean') {
+              key.fromMe = findMessageKey.fromMe;
             }
 
             if (item.message === null && item.status === undefined) {
@@ -896,19 +1009,16 @@ export class BusinessStartupService extends ChannelStartupService {
 
   protected async eventHandler(content: any) {
     try {
-      // Registro para depuración
       this.logger.log('Contenido recibido en eventHandler:');
       this.logger.log(JSON.stringify(content, null, 2));
 
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
 
-      // Si hay mensajes, verificar primero el tipo
       if (content.messages && content.messages.length > 0) {
         const message = content.messages[0];
         this.logger.log(`Tipo de mensaje recibido: ${message.type}`);
 
-        // Verificamos el tipo de mensaje antes de procesarlo
         if (
           message.type === 'text' ||
           message.type === 'image' ||
@@ -922,14 +1032,12 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'button' ||
           message.type === 'reaction'
         ) {
-          // Procesar el mensaje normalmente
-          this.messageHandle(content, database, settings);
+          await this.messageHandle(content, database, settings);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
         }
       } else if (content.statuses) {
-        // Procesar actualizaciones de estado
-        this.messageHandle(content, database, settings);
+        await this.messageHandle(content, database, settings);
       } else {
         this.logger.warn('No se encontraron mensajes ni estados en el contenido recibido');
       }
@@ -1195,7 +1303,7 @@ export class BusinessStartupService extends ChannelStartupService {
     return res;
   }
 
-  private async getIdMedia(mediaMessage: any, isFile = false) {
+  protected async getIdMedia(mediaMessage: any, isFile = false) {
     try {
       const formData = new FormData();
 

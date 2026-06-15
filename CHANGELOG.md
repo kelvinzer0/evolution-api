@@ -1,3 +1,278 @@
+# 2.4.0-rc2 (2026-05-17)
+
+Estabilização sobre `2.4.0-rc1`. Sem mudanças de banco nem de contrato HTTP — apenas fixes em fluxos do Baileys/WhatsApp e Evolution Channel, suporte nativo a GIF e um caminho opcional de auto-ativação headless da licença.
+
+### Fixed
+
+- **WhatsApp — bypass de validação `onWhatsApp` para contatos `@lid`** ([#2544](https://github.com/evolution-foundation/evolution-api/pull/2544)). Após a migração para LID (Linked Identity) do WhatsApp, contatos cujo JID termina em `@lid` retornavam `exists: false` no `onWhatsApp` da Baileys, fazendo `sendMessageWithTyping` e `sendPresence` lançarem `BadRequestException`. O bypass que já existia para `@broadcast` foi estendido para incluir `@lid`.
+
+- **WhatsApp — `quoted` agora é propagado em `sendWhatsAppAudio`** ([#2516](https://github.com/evolution-foundation/evolution-api/pull/2516), corrige [#2485](https://github.com/evolution-foundation/evolution-api/issues/2485)). Envios de áudio com payload `quoted` deixavam de chegar como resposta encadeada — o áudio caía como mensagem solta. Corrigido nos dois caminhos do `audioWhatsapp` (encoded e direct).
+
+- **Instance API — `instanceName` agora é trimado na criação** ([#2546](https://github.com/evolution-foundation/evolution-api/pull/2546), corrige [#2543](https://github.com/evolution-foundation/evolution-api/issues/2543)). Nomes com espaços inicial/final eram persistidos no banco mas, ao serem chamados via URL (`DELETE /instance/delete/:name`), os espaços eram normalizados, gerando `404` por mismatch. Aplicado `.trim()` no início de `createInstance`.
+
+- **Evolution Channel — instâncias deixam de ficar travadas em `close`** ([#2420](https://github.com/evolution-foundation/evolution-api/pull/2420), corrige [#2419](https://github.com/evolution-foundation/evolution-api/issues/2419)). Como o Evolution Channel é webhook-only (passivo), a instância deveria estar sempre `open`. Agora, no boot do monitor e na criação da instância, `connectToWhatsapp()` é chamado para instâncias `EVOLUTION` e o `connectionStatus` é persistido como `open` no banco.
+
+### Added
+
+- **WhatsApp — suporte nativo a GIF sem conversão para vídeo** ([#2540](https://github.com/evolution-foundation/evolution-api/pull/2540)). DTO e schema de envio de mídia agora aceitam `gifPlayback` (boolean) e `gifAttribution` (0/1/2), propagados para a Baileys. Backward-compat preservado: default segue `gifPlayback: false` quando o cliente não envia o campo.
+
+- **Licensing — auto-ativação headless via `EVOLUTION_OPERATOR_EMAIL`**. Quando a env `EVOLUTION_OPERATOR_EMAIL` está configurada, o `initializeRuntime` chama silenciosamente o endpoint `/v1/register/auto` do licensing server no boot, persiste a `api_key` retornada e ativa a instância — pulando o fluxo de registro pelo browser. **Pré-requisito**: o e-mail precisa ter sido registrado uma vez previamente no licensing server. Em qualquer falha (e-mail desconhecido, servidor inacessível, key suspensa) o sistema **faz fallback não-fatal** para o fluxo de registro manual no `/manager`.
+
+### Notas para upgrade a partir de `2.4.0-rc1`
+
+- Não há mudança de banco nem de contrato HTTP — basta atualizar a imagem.
+- Quem usa `sendWhatsAppAudio` com `quoted` passa a ver o áudio como resposta encadeada (comportamento agora alinhado aos demais métodos de envio).
+- Instâncias do Evolution Channel que estavam em `close` no banco serão promovidas a `open` no próximo boot. Se você dependia desse estado para pausar instâncias manualmente, considere usar outro mecanismo de gate, pois esse fluxo passa a ser sobrescrito.
+
+---
+
+# 2.4.0 (2026-05-06)
+
+### ⚠️ BREAKING CHANGE — License activation is now required
+
+Starting with v2.4.0, every Evolution API instance must be activated against the
+Evolution Foundation licensing server before serving API traffic. Until activation,
+all business endpoints return:
+
+```
+HTTP 503 Service Unavailable
+{
+  "error": "service not activated",
+  "code": "LICENSE_REQUIRED",
+  "register_url": "https://<your-host>/manager/login",
+  "instance_id": "<uuid>",
+  "docs_url": "https://docs.evolutionfoundation.com.br/licensing",
+  "message": "..."
+}
+```
+
+The following routes always remain public so the operator can recover:
+`/license/status`, `/license/register`, `/license/activate`, `/manager/**`,
+`/health`, `/server/ok`, `/ws`, static assets.
+
+### Migration guide
+
+1. Pull the new version and install dependencies:
+   ```bash
+   git pull
+   npm install
+   ```
+
+2. Apply the new migration (creates the `RuntimeConfig` table). Required:
+   ```bash
+   npm run db:deploy
+   ```
+   If you skip this step, the server now fails fast with a clear error
+   asking you to run `db:deploy`.
+
+3. Start the service. There are three activation paths:
+
+   - **Already have a valid licensing key?** Set it as `AUTHENTICATION_API_KEY`
+     in your `.env` and restart. The bootstrap step will validate the key with
+     the licensing server, persist it, and activate the instance automatically.
+
+   - **First-time activation via the manager UI?** Open
+     `https://<your-host>/manager/login`. The manager detects that the
+     instance is unlicensed and redirects you to the registration page on
+     the licensing server. After you complete the form, you are sent back
+     to `/manager/license/callback?code=...`, the manager exchanges the code,
+     and the dashboard becomes accessible.
+
+   - **Calling the API from code (n8n, Make, custom scripts) without a valid
+     license?** Every request will receive `503 LICENSE_REQUIRED` with the
+     `register_url` field pointing to the manager. Open it in a browser to
+     activate.
+
+### Added
+
+#### Manager v2 — completely redesigned dashboard
+
+The embedded manager (served at `/manager`) was rebuilt from the ground up
+on **Tailwind v4** + the new **`@evoapi/design-system`**, using the same
+visual language as the rest of the Evolution Foundation product line.
+Every screen was refactored — no surface remains untouched.
+
+Highlights:
+
+- **Modern dashboard** with skeleton loading, illustrated empty state,
+  and a typed-name confirmation modal for instance deletion (no more
+  accidental clicks).
+- **Dual-provider support**: the manager now talks to either
+  `evolution-api` or `evolution-go` (selected at login, persisted in
+  localStorage). When connected to a GO backend, the sidebar/router
+  automatically hide the modules GO does not implement.
+- **Sessions panels** for the seven chatbot integrations (OpenAI, Dify,
+  N8N, EvoAI, EvolutionBot, Flowise, Typebot) gained advanced filters
+  (name / number / status / time presets + custom),
+  bulk-status-change actions, client-side pagination, and a real
+  send-message modal calling `/message/sendText`.
+- **License-aware login** — see the *Licensing* section below for the
+  details.
+- **🧪 Test Interactive** modal on each instance card — a 5-tab
+  payload editor (Reply / CTA / PIX / List / Carousel) for
+  smoke-testing the new interactive-message endpoints from the
+  dashboard. Replaces the legacy stand-alone `test-interactive.js`
+  vanilla script that used to be injected into `index.html`.
+- **Full i18n coverage** in **pt-BR / en-US / es-ES / fr-FR** — every
+  screen, every toast, every modal.
+- **Branding refresh** — sidebar/footer/login point to
+  `docs.evolutionfoundation.com.br`, GitHub links to
+  `evolution-foundation/evolution-manager-v2`, contact to
+  `suporte@evofoundation.com.br`.
+
+The new bundle is shipped pre-built under `manager/dist/`. The manager
+source repository moved to `evolution-foundation/evolution-manager-v2`
+(private) — the previous in-repo submodule was dropped.
+
+#### Licensing
+- **Licensing module** under `src/licensing/` — RuntimeContext, gate middleware,
+  signed/unsigned HTTP transport, hardware-based instance ID, fire-and-forget
+  heartbeat (every 30 min), graceful shutdown deactivation. Mirrors the
+  evolution-go `pkg/core/` reference implementation.
+- **Public license endpoints**:
+  - `GET /license/status` — current activation state and (masked) api_key
+  - `GET /license/register?redirect_uri=` — initiates registration on the
+    licensing server, returns `register_url`
+  - `GET /license/activate?code=` — exchanges the authorization code received
+    on the callback for a real api_key, persists it, marks the runtime active.
+- **New Prisma model** `RuntimeConfig` (key/value rows in `RuntimeConfig` table)
+  for both PostgreSQL and MySQL schemas.
+- **Auto-detect missing migration**: if the `RuntimeConfig` table is absent,
+  the server prints a clear banner explaining `npm run db:deploy` and exits 1
+  instead of throwing a stack trace from the Prisma client.
+- **Manager v2** ships with the new license-aware login flow that recognises
+  HTTP 503 / `LICENSE_REQUIRED`, calls `/license/register`, and redirects to
+  the registration server. After the callback, it lands on
+  `/manager/license/callback?code=...` and finalises activation. The new
+  manager bundle is included under `manager/dist/`.
+
+#### Interactive Messages (Buttons / List / CTA / PIX / Carousel)
+- **New endpoint `POST /message/sendCarousel/{instance}`** — multi-card
+  product carousel built on top of `interactiveMessage` + `carouselMessage`.
+  Single-card-without-image falls back to `nativeFlowMessage` for iOS
+  compatibility. New DTO `SendCarouselDto`, schema `carouselMessageSchema`.
+- **Button rendering fixed on WhatsApp Web/Desktop/iOS/Android** — removed the
+  `viewOnceMessage` wrapper that prevented buttons from rendering and started
+  injecting the required `<biz><interactive type=native_flow v=1>
+  <native_flow v=9 name=mixed/></interactive></biz>` node into the
+  `relayMessage` stanza via Baileys' official `additionalNodes` option.
+- **List messages fixed on WhatsApp Web/Desktop** — switched to legacy
+  `listMessage` with `SINGLE_SELECT` listType (the modern
+  `interactiveMessage + single_select` format does not render on Web/Desktop)
+  and added `<biz><list type=product_list v=2/></biz>`.
+- **Interactive buttons via `deviceSentMessage`** + corrected CTA limits
+  (max 2 CTA buttons, no mixing with reply or PIX), aligning with the
+  WhatsApp Business message contract.
+- **PIX support** for interactive button messages (`payment_info` button
+  type — exactly 1 button, isolated).
+- **Quoted product / Catalog `orderMessage`** support — handles
+  `quotedMessage.productMessage` and the catalog `orderMessage` shape,
+  including `getTypeMessage` enrichment, deduplication cache for
+  processed order IDs, and propagation through Chatwoot integration.
+- Manager UI: a `🧪 Test Interactive` button on each instance card opens
+  a modal with five tabs (Reply / CTA / PIX / List / Carousel) and an
+  editable JSON payload — useful for smoke-testing every kind of
+  interactive message without leaving the dashboard.
+
+#### History Sync
+- **New event `messaging-history.set`** emitted on sync completion, with
+  cumulative counts (chats, contacts, messages, isLatest, progress).
+  Allows downstream consumers to know exactly when a history sync has
+  finished and how much was imported.
+- Cumulative counters reset on a new sync start to avoid carry-over
+  between consecutive syncs.
+
+#### Other
+- **New endpoint `POST /chat/markMessageAsPlayed/{instance}`** — emits the
+  audio "played" receipt (PTT/VOICE), completing the read/delivered/played
+  triplet for voice messages.
+- **SQS integration** now accepts a custom `base_url` (useful for
+  LocalStack and corporate VPC endpoints).
+- **LID → phone-number mapping and caching** — translates the new
+  `@lid` identifiers WhatsApp uses for hidden-phone profiles into the
+  real `@s.whatsapp.net` JID for downstream processing, with a cache
+  to avoid redundant lookups.
+
+#### Branding / Documentation
+- README, LICENSE, NOTICE, TRADEMARKS standardised under the
+  **Evolution Foundation 2026** identity.
+- All GitHub URLs migrated from `EvolutionAPI` to `evolution-foundation`.
+- New README section "License Activation" linking to
+  <https://docs.evolutionfoundation.com.br/licensing>.
+
+### Fixed
+
+- **`mentionsEveryOne` honours `false`** — earlier the flag was always
+  applied regardless of value (#2470).
+- **`getLastMessage`**: corrected the Prisma JSON path filter so the
+  query returns the actual last message (#2495 / #2515).
+- **`markMessageAsRead`**: corrected JID filter to cover all user types
+  (regular, business, broadcast, group).
+- **List messages**: removed destructive JSON cloning that triggered
+  `this.isZero` when the message contained `Long`-typed fields (#2461).
+- **History sync race condition**: completion event is now emitted
+  *before* the contact upsert, so consumers don't observe the sync as
+  finished while contacts are still being written (#2510).
+- **Business API (Cloud)**: race condition in sender identification
+  resolved (#2493); execution order normalised; `chatwootIds`
+  correctly propagated.
+- **`/instance/logout/{instance}`** — idempotent: returns SUCCESS instead
+  of 400 when the instance is already closed, so the manager UI delete
+  flow (logout-then-delete) does not surface a misleading error.
+- **`remove.instance` event** — emitted even when logout itself fails,
+  preventing zombie instances after a partially failed delete (#2520).
+- **Chatbot session**: a closed session no longer blocks bot
+  re-activation.
+- **Docker compose**: fresh-install startup failures resolved.
+- **WhatsApp chats**: `accountLid` handling, `remoteJid` normalisation
+  and `chatsRaw` mapping cleaned up to avoid mismatched contact data
+  on first connection.
+- **Facebook ads**: `externalAdReply` context readability and fallback
+  path for missing fields.
+- **Networking**: added the `--network-family-autoselection-attempt-timeout`
+  flag in `start:prod` so IPv4/IPv6 races no longer hang the boot on
+  hosts with broken IPv6.
+- **Trailing slashes** on configuration URLs are now tolerated in all
+  HTTP clients.
+- Verbose-log fix: undefined `maxRetries` reference inside the
+  `messages.update` handler.
+
+### Notes
+
+- `AUTHENTICATION_API_KEY` keeps its original meaning (global API key for
+  business endpoints) **and** gains a second use as the bootstrap license
+  key. If the value you have is a real licensing key, activation is silent.
+  If it is not, the service starts unlicensed and waits for activation via
+  the manager.
+- Activation is a one-time operation. The `api_key` is stored in the database
+  and reused across restarts. The licensing server is only consulted again
+  for periodic heartbeats (telemetry — non-blocking) and on graceful shutdown
+  (`/v1/deactivate`).
+- If the licensing server is unreachable but the instance has been activated
+  before, the service continues to serve traffic normally — local DB is the
+  source of truth for activation state after the first successful call.
+- Release builds bake the licensing endpoint into the bundle as an XOR-encoded
+  string via tsup `define`, so the URL never appears as a plain literal in
+  `dist/main.js`. Generate the pair with `node tools/encode-url.js <url>` and
+  pass `LICENSE_ENDPOINT_ENCODED` / `LICENSE_ENDPOINT_XOR_KEY` as Docker
+  build-args (NOT runtime env vars). Local dev builds use a parts-array
+  fallback that still avoids a single string literal but is not obfuscated.
+
+### Troubleshooting
+
+- **`HTTP 503 LICENSE_REQUIRED`** — expected before activation. Follow the
+  migration guide.
+- **`The table evolution_api.RuntimeConfig does not exist`** (legacy stack
+  trace if you somehow bypass the new auto-detect) — run `npm run db:deploy`.
+- **`Global API key not accepted by licensing server: invalid signature`** —
+  your existing `AUTHENTICATION_API_KEY` is not a valid licensing key. Use
+  the manager UI flow to obtain a new one.
+- **Buttons/list not rendering on WhatsApp Web** — make sure you are on
+  v2.4.0+; the `<biz>` stanza node and the legacy `listMessage` payload
+  shipped with this release are required for cross-client rendering.
+
+---
+
 # 2.3.7 (2025-12-05)
 
 ### Features

@@ -191,3 +191,17 @@ export const updateGroupDescriptionSchema: JSONSchema7 = {
   required: ['groupJid', 'description'],
   ...isNotEmpty('groupJid', 'description'),
 };
+
+export const updateMemberAddModeSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    groupJid: { type: 'string' },
+    mode: {
+      type: 'string',
+      enum: ['admin_add', 'all_member_add'],
+    },
+  },
+  required: ['groupJid', 'mode'],
+  ...isNotEmpty('groupJid', 'mode'),
+};

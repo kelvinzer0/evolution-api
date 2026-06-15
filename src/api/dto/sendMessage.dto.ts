@@ -25,6 +25,8 @@ export class MediaMessage {
   fileName?: string;
   // url or base64
   media: string;
+  gifPlayback?: boolean | string;
+  gifAttribution?: number | string;
 }
 
 export class StatusMessage {
@@ -83,6 +85,8 @@ export class SendMediaDto extends Metadata {
   fileName?: string;
   // url or base64
   media: string;
+  gifPlayback?: boolean | string;
+  gifAttribution?: number | string;
 }
 
 export class SendPtvDto extends Metadata {

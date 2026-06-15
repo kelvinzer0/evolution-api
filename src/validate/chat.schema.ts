@@ -63,6 +63,28 @@ export const readMessageSchema: JSONSchema7 = {
   required: ['readMessages'],
 };
 
+export const markMessageAsPlayedSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    playedMessages: {
+      type: 'array',
+      minItems: 1,
+      uniqueItems: true,
+      items: {
+        properties: {
+          id: { type: 'string' },
+          fromMe: { type: 'boolean', enum: [true, false] },
+          remoteJid: { type: 'string' },
+        },
+        required: ['id', 'fromMe', 'remoteJid'],
+        ...isNotEmpty('id', 'remoteJid'),
+      },
+    },
+  },
+  required: ['playedMessages'],
+};
+
 export const archiveChatSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
@@ -315,4 +337,13 @@ export const profileSchema: JSONSchema7 = {
     status: { type: 'string' },
     isBusiness: { type: 'boolean' },
   },
+};
+
+export const fetchLidSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    number: { type: 'string' },
+  },
+  required: ['number'],
 };

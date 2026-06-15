@@ -31,6 +31,16 @@ RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
 
 RUN ./Docker/scripts/generate_database.sh
 
+# Licensing endpoint is XOR-encoded into the bundle by tsup `define`. Pass the
+# pair via build-args (NEVER as runtime env vars) to keep the URL out of the
+# compiled JavaScript as a plain literal. Generate them with
+# `node tools/encode-url.js <url>`. Leaving them empty is OK for non-release
+# builds — the dev fallback in src/licensing/endpoint.ts kicks in.
+ARG LICENSE_ENDPOINT_ENCODED
+ARG LICENSE_ENDPOINT_XOR_KEY
+ENV LICENSE_ENDPOINT_ENCODED=${LICENSE_ENDPOINT_ENCODED}
+ENV LICENSE_ENDPOINT_XOR_KEY=${LICENSE_ENDPOINT_XOR_KEY}
+
 RUN NODE_OPTIONS="--max-old-space-size=2048" npm run build
 
 FROM node:24-alpine AS final

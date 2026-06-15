@@ -70,6 +70,10 @@ export class ReadMessageDto {
   readMessages: Key[];
 }
 
+export class MarkMessageAsPlayedDto {
+  playedMessages: Key[];
+}
+
 export class LastMessage {
   key: Key;
   messageTimestamp?: number;

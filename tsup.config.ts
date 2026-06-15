@@ -8,6 +8,11 @@ import { defineConfig } from 'tsup';
 // então o reforçamos aqui para o client gerado ser bundlado (em vez do pacote real,
 // que não deve ser importado diretamente no v7). O runtime (@prisma/client/runtime/*)
 // permanece externo (node_modules) por ser dependência.
+// Build-time licensing URL — passed via env vars only at build time, baked
+// into the bundle by `define`. See src/licensing/endpoint.ts.
+const licenseEndpointEncoded = JSON.stringify(process.env.LICENSE_ENDPOINT_ENCODED ?? '');
+const licenseEndpointXorKey = JSON.stringify(process.env.LICENSE_ENDPOINT_XOR_KEY ?? '');
+
 export default defineConfig({
   entry: ['src'],
   outDir: 'dist',
@@ -28,6 +33,9 @@ export default defineConfig({
       ...(options.alias ?? {}),
       '@prisma/client': path.resolve(process.cwd(), 'prisma/generated/client/client.ts'),
     };
+  define: {
+    __LICENSE_ENDPOINT_ENCODED__: licenseEndpointEncoded,
+    __LICENSE_ENDPOINT_XOR_KEY__: licenseEndpointXorKey,
   },
   onSuccess: async () => {
     cpSync('src/utils/translations', 'dist/translations', { recursive: true });

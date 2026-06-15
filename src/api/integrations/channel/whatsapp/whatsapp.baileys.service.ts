@@ -7,6 +7,7 @@ import {
   getBase64FromMediaMessageDto,
   LastMessage,
   MarkChatUnreadDto,
+  MarkMessageAsPlayedDto,
   NumberBusiness,
   OnWhatsAppDto,
   PrivacySettingDto,
@@ -26,6 +27,7 @@ import {
   GroupSendInvite,
   GroupSubjectDto,
   GroupToggleEphemeralDto,
+  GroupUpdateMemberAddModeDto,
   GroupUpdateParticipantDto,
   GroupUpdateSettingDto,
 } from '@api/dto/group.dto';
@@ -227,6 +229,12 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+function normalizeListType(listMessage?: proto.Message.IListMessage | null): void {
+  if (listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST) {
+    listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+  }
+}
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -255,6 +263,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private _lastStream515At = 0;
 
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
@@ -266,6 +275,13 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  // Reconnect behaviour for the Baileys "stream:error 515" sequence.
+  // After WhatsApp emits 515 it usually closes with `loggedOut`; that close is *not* a real logout
+  // and we should reconnect. We treat any close arriving within this grace window as 515-driven.
+  private static readonly STREAM_515_RECONNECT_GRACE_MS = 30_000;
+  // The numeric WhatsApp stream-error code that triggers the grace-period reconnect above.
+  private static readonly STREAM_ERROR_CODE_RECONNECT = '515';
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -275,7 +291,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
-    // Mark instance as deleting to prevent reconnection attempts
+    // Mark instance as deleting to prevent reconnection attempts.
     this.isDeleting = true;
     this.endSession = true;
 
@@ -285,17 +301,26 @@ export class BaileysStartupService extends ChannelStartupService {
       try {
         await this.client.logout('Log out instance: ' + this.instanceName);
       } catch (error) {
-        this.logger.error({ message: 'Error during logout', error });
+        // Downgraded to warn: logout failures here are recoverable — the
+        // credential cleanup below still runs and the DB row is forced to 'close'.
+        this.logger.warn(
+          `logoutInstance: client.logout() failed (${(error as Error)?.message}), proceeding with credential cleanup`,
+        );
       }
 
-      // Improved socket cleanup
+      // Improved socket cleanup.
       try {
         this.client.ws?.close();
         this.client.end(new Error('Instance logout'));
-      } catch (error) {
-        this.logger.error({ message: 'Error during socket cleanup', error });
+      } catch {
+        // ignore — ws may already be closed
       }
     }
+
+    // Force the in-memory connection state to 'close' so any concurrent reader
+    // observes the post-logout state immediately, even if the DB update below
+    // is delayed.
+    this.stateConnection = { state: 'close', statusReason: 401 };
 
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -323,6 +348,11 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: { connectionStatus: 'close' },
+    });
   }
 
   public async getProfileName() {
@@ -470,7 +500,9 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
+      // 408 = request timeout — added per #2501 to avoid reconnect loops on
+      // transient network drops where the server returned a 408 in the close.
+      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
       // This prevents infinite loop that blocks QR code generation
@@ -481,7 +513,12 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      // If a stream:error 515 (Baileys' "restart needed" handshake) just fired,
+      // a follow-up loggedOut is the expected restart signal — not an actual
+      // logout — so reconnect anyway.
+      const recentStream515 = Date.now() - this._lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
+      const shouldReconnect =
+        !codesToNotReconnect.includes(statusCode) || (statusCode === DisconnectReason.loggedOut && recentStream515);
 
       this.logger.info({
         message: 'Connection closed, evaluating reconnection',
@@ -533,6 +570,10 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      if (!this.client?.user?.id) {
+        this.logger.warn('connectionUpdate: connection open but client.user is undefined, skipping');
+        return;
+      }
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -755,19 +796,8 @@ export class BaileysStartupService extends ChannelStartupService {
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
       patchMessageBeforeSending(message) {
-        if (
-          message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
-        ) {
-          message = JSON.parse(JSON.stringify(message));
-
-          message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
-
-        if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
-          message = JSON.parse(JSON.stringify(message));
-
-          message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
+        normalizeListType(message.deviceSentMessage?.message?.listMessage);
+        normalizeListType(message.listMessage);
 
         return message;
       },
@@ -793,6 +823,12 @@ export class BaileysStartupService extends ChannelStartupService {
       console.log('CB:ack,class:call', packet);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+    });
+
+    this.client.ws.on('CB:stream:error', (node: { attrs?: { code?: string | number } }) => {
+      if (String(node?.attrs?.code) === BaileysStartupService.STREAM_ERROR_CODE_RECONNECT) {
+        this._lastStream515At = Date.now();
+      }
     });
 
     this.phoneNumber = number;
@@ -1020,13 +1056,15 @@ export class BaileysStartupService extends ChannelStartupService {
       syncType?: proto.HistorySync.HistorySyncType;
     }) => {
       try {
-        // Reset counters when a new sync starts (progress resets or decreases)
-        if (progress <= this.historySyncLastProgress) {
+        const normalizedProgress = progress ?? -1;
+
+        if (normalizedProgress <= this.historySyncLastProgress) {
           this.historySyncMessageCount = 0;
           this.historySyncChatCount = 0;
           this.historySyncContactCount = 0;
         }
-        this.historySyncLastProgress = progress ?? -1;
+
+        this.historySyncLastProgress = normalizedProgress;
 
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
           console.log('received on-demand history sync, messages=', messages);
@@ -1203,15 +1241,12 @@ export class BaileysStartupService extends ChannelStartupService {
         const filteredContacts = contacts.filter((c) => !!c.notify || !!c.name);
         this.historySyncContactCount += filteredContacts.length;
 
-        await this.contactHandle['contacts.upsert'](
-          filteredContacts.map((c) => ({ id: c.id, name: c.name ?? c.notify })),
-        );
-
-        if (progress === 100) {
+        if (normalizedProgress === 100) {
           this.sendDataWebhook(Events.MESSAGING_HISTORY_SET, {
             messageCount: this.historySyncMessageCount,
             chatCount: this.historySyncChatCount,
             contactCount: this.historySyncContactCount,
+            progress: normalizedProgress,
           });
 
           this.historySyncMessageCount = 0;
@@ -1219,6 +1254,10 @@ export class BaileysStartupService extends ChannelStartupService {
           this.historySyncContactCount = 0;
           this.historySyncLastProgress = -1;
         }
+
+        await this.contactHandle['contacts.upsert'](
+          filteredContacts.map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+        );
 
         contacts = undefined;
         messages = undefined;
@@ -2249,6 +2288,22 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  public async getLid(number: string) {
+    const jid = createJid(number);
+
+    if (!this.client?.signalRepository) {
+      return { wuid: jid, lid: null };
+    }
+
+    try {
+      const lid = await this.client.signalRepository.lidMapping.getLIDForPN(jid);
+      return { wuid: jid, lid: lid || null };
+    } catch (error) {
+      console.error(`Failed to fetch LID for ${jid}:`, error);
+      return { wuid: jid, lid: null };
+    }
+  }
+
   public async getStatus(number: string) {
     const jid = createJid(number);
 
@@ -2539,7 +2594,7 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
-    if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
+    if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast') && !isWA.jid.includes('@lid')) {
       throw new BadRequestException(isWA);
     }
 
@@ -2622,7 +2677,7 @@ export class BaileysStartupService extends ChannelStartupService {
           throw new NotFoundException('Group not found');
         }
 
-        if (options?.mentionsEveryOne) {
+        if (options?.mentionsEveryOne === true) {
           mentions = group.participants.map((participant) => participant.id);
         } else if (options?.mentioned?.length) {
           mentions = options.mentioned.map((mention) => {
@@ -2823,7 +2878,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
-      if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
+      if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast') && !isWA.jid.includes('@lid')) {
         throw new BadRequestException(isWA);
       }
 
@@ -3136,7 +3191,14 @@ export class BaileysStartupService extends ChannelStartupService {
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
 
       if (mediaMessage.mediatype === 'video') {
-        prepareMedia[mediaType].gifPlayback = false;
+        prepareMedia[mediaType].gifPlayback = mediaMessage.gifPlayback === true || mediaMessage.gifPlayback === 'true';
+
+        if (mediaMessage.gifAttribution !== undefined) {
+          const gifAttribution = Number(mediaMessage.gifAttribution);
+          if (gifAttribution === 0 || gifAttribution === 1 || gifAttribution === 2) {
+            prepareMedia[mediaType].gifAttribution = gifAttribution;
+          }
+        }
       }
 
       return generateWAMessageFromContent(
@@ -3488,7 +3550,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const result = this.sendMessageWithTyping<AnyMessageContent>(
           data.number,
           messageContent as any,
-          { presence: 'recording', delay: data?.delay },
+          { presence: 'recording', delay: data?.delay, quoted: data?.quoted },
           isIntegration,
         );
 
@@ -3508,7 +3570,7 @@ export class BaileysStartupService extends ChannelStartupService {
         ptt: true,
         mimetype: 'audio/ogg; codecs=opus',
       },
-      { presence: 'recording', delay: data?.delay },
+      { presence: 'recording', delay: data?.delay, quoted: data?.quoted },
       isIntegration,
     );
   }
@@ -4092,7 +4154,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const keys: proto.IMessageKey[] = [];
       data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
+        if (!isJidBroadcast(read.remoteJid) && !isJidNewsletter(read.remoteJid)) {
           keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
         }
       });
@@ -4103,8 +4165,26 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  public async markMessageAsPlayed(data: MarkMessageAsPlayedDto) {
+    try {
+      const keys: proto.IMessageKey[] = [];
+      data.playedMessages.forEach((played) => {
+        if (isJidGroup(played.remoteJid) || isPnUser(played.remoteJid)) {
+          keys.push({ remoteJid: played.remoteJid, fromMe: played.fromMe, id: played.id });
+        }
+      });
+      // Baileys exposes sendReceipts(keys, type) where type='played' triggers the
+      // PLAYED ack (blue microphone). Used when an agent plays back an audio
+      // message received from a contact, mirroring the contact's view in WhatsApp.
+      await this.client.sendReceipts(keys, 'played');
+      return { message: 'Played messages', played: 'success' };
+    } catch (error) {
+      throw new InternalServerErrorException('Mark messages as played fail', error.toString());
+    }
+  }
+
   public async getLastMessage(number: string) {
-    const where: any = { key: { remoteJid: number }, instanceId: this.instance.id };
+    const where: any = { key: { path: ['remoteJid'], equals: number }, instanceId: this.instanceId };
 
     const messages = await this.prismaRepository.message.findMany({
       where,
@@ -5000,6 +5080,15 @@ export class BaileysStartupService extends ChannelStartupService {
       return { updateSetting: updateSetting };
     } catch (error) {
       throw new BadRequestException('Error updating setting', error.toString());
+    }
+  }
+
+  public async updateMemberAddMode(update: GroupUpdateMemberAddModeDto) {
+    try {
+      await this.client.groupMemberAddMode(update.groupJid, update.mode);
+      return { update: 'success', mode: update.mode };
+    } catch (error) {
+      throw new BadRequestException('Error updating member add mode', error.toString());
     }
   }
 
