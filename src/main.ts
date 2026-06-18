@@ -73,10 +73,14 @@ async function bootstrap() {
   app.use('/store', express.static(join(ROOT_DIR, 'store')));
 
   // Swagger UI
-  app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
-    customCss: '.swagger-ui .topbar { display: none }',
-    customSiteTitle: 'Evolution API Documentation',
-  }));
+  app.use(
+    '/docs',
+    swaggerUi.serve,
+    swaggerUi.setup(swaggerSpec, {
+      customCss: '.swagger-ui .topbar { display: none }',
+      customSiteTitle: 'Evolution API Documentation',
+    }),
+  );
 
   // OpenAPI JSON endpoint
   app.get('/openapi.json', (req, res) => {

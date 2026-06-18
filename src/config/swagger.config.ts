@@ -1,5 +1,9 @@
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import swaggerJsdoc from 'swagger-jsdoc';
-import { version } from '../package.json';
+
+const packageJson = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf-8'));
+const { version } = packageJson;
 
 const options: swaggerJsdoc.Options = {
   definition: {
