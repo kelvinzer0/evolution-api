@@ -11,4 +11,5 @@ export class getCatalogDto {
 export class getCollectionsDto {
   number?: string;
   limit?: number;
+  cursor?: string;
 }

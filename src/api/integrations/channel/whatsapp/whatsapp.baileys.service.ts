@@ -4901,8 +4901,8 @@ export class BaileysStartupService extends ChannelStartupService {
   //Business Controller
   public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
-    const limit = data.limit || 10;
-    const cursor = null;
+    const limit = data.limit || 50;
+    const cursor = data.cursor || null;
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
 
@@ -4924,7 +4924,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       let productsCatalog = catalog.products || [];
       let countLoops = 0;
-      while (fetcherHasMore && countLoops < 4) {
+      while (fetcherHasMore && countLoops < 20) {
         catalog = await this.getCatalog({ jid: info?.jid, limit, cursor: nextPageCursor });
         nextPageCursor = catalog.nextPageCursor;
         nextPageCursorJson = nextPageCursor ? JSON.parse(atob(nextPageCursor)) : null;
@@ -4971,7 +4971,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async fetchCollections(instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
-    const limit = data.limit <= 20 ? data.limit : 20; //(tem esse limite, não sei porque)
+    const limit = data.limit || 100;
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
 
