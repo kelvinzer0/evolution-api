@@ -7,10 +7,50 @@ import { RequestHandler, Router } from 'express';
 
 import { HttpStatus } from './index.router';
 
+/**
+ * Business Router - Handles WhatsApp Business catalog operations
+ * @tags Business
+ */
 export class BusinessRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
     this.router
+      /**
+       * @swagger
+       * /business/getCatalog/{instanceName}:
+       *   post:
+       *     tags: [Business]
+       *     summary: Get WhatsApp Business catalog
+       *     description: Fetches all products from a WhatsApp Business catalog with automatic pagination
+       *     security:
+       *       - apikey: []
+       *     parameters:
+       *       - in: path
+       *         name: instanceName
+       *         required: true
+       *         schema:
+       *           type: string
+       *         description: Instance name
+       *     requestBody:
+       *       required: true
+       *       content:
+       *         application/json:
+       *           schema:
+       *             $ref: '#/components/schemas/CatalogRequest'
+       *     responses:
+       *       200:
+       *         description: Catalog retrieved successfully
+       *         content:
+       *           application/json:
+       *             schema:
+       *               $ref: '#/components/schemas/CatalogResponse'
+       *       400:
+       *         description: Bad request
+       *         content:
+       *           application/json:
+       *             schema:
+       *               $ref: '#/components/schemas/ErrorResponse'
+       */
       .post(this.routerPath('getCatalog'), ...guards, async (req, res) => {
         try {
           const response = await this.dataValidate<NumberDto>({
@@ -31,6 +71,42 @@ export class BusinessRouter extends RouterBroker {
         }
       })
 
+      /**
+       * @swagger
+       * /business/getCollections/{instanceName}:
+       *   post:
+       *     tags: [Business]
+       *     summary: Get WhatsApp Business collections
+       *     description: Fetches all collections with their products from a WhatsApp Business account
+       *     security:
+       *       - apikey: []
+       *     parameters:
+       *       - in: path
+       *         name: instanceName
+       *         required: true
+       *         schema:
+       *           type: string
+       *         description: Instance name
+       *     requestBody:
+       *       required: true
+       *       content:
+       *         application/json:
+       *           schema:
+       *             $ref: '#/components/schemas/CollectionsRequest'
+       *     responses:
+       *       200:
+       *         description: Collections retrieved successfully
+       *         content:
+       *           application/json:
+       *             schema:
+       *               $ref: '#/components/schemas/CollectionsResponse'
+       *       400:
+       *         description: Bad request
+       *         content:
+       *           application/json:
+       *             schema:
+       *               $ref: '#/components/schemas/ErrorResponse'
+       */
       .post(this.routerPath('getCollections'), ...guards, async (req, res) => {
         try {
           const response = await this.dataValidate<NumberDto>({

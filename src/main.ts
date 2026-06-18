@@ -18,6 +18,7 @@ import {
 import { onUnexpectedError } from '@config/error.config';
 import { Logger } from '@config/logger.config';
 import { ROOT_DIR } from '@config/path.config';
+import { swaggerSpec } from '@config/swagger.config';
 import * as Sentry from '@sentry/node';
 import { ServerUP } from '@utils/server-up';
 import axios from 'axios';
@@ -25,6 +26,7 @@ import compression from 'compression';
 import cors from 'cors';
 import express, { json, NextFunction, Request, Response, urlencoded } from 'express';
 import { join } from 'path';
+import swaggerUi from 'swagger-ui-express';
 
 async function initWA() {
   await waMonitor.loadInstance();
@@ -69,6 +71,18 @@ async function bootstrap() {
   app.use(express.static(join(ROOT_DIR, 'public')));
 
   app.use('/store', express.static(join(ROOT_DIR, 'store')));
+
+  // Swagger UI
+  app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+    customCss: '.swagger-ui .topbar { display: none }',
+    customSiteTitle: 'Evolution API Documentation',
+  }));
+
+  // OpenAPI JSON endpoint
+  app.get('/openapi.json', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(swaggerSpec);
+  });
 
   app.use('/', router);
 

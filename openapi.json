@@ -1,0 +1,150 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Evolution API",
+    "version": "2.3.7",
+    "description": "WhatsApp API - OpenAPI Documentation",
+    "contact": {
+      "name": "Evolution API",
+      "url": "https://github.com/EvolutionAPI/evolution-api"
+    }
+  },
+  "servers": [
+    {
+      "url": "/v1",
+      "description": "API v1"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "apikey": {
+        "type": "apiKey",
+        "name": "apikey",
+        "in": "header",
+        "description": "API key for authentication"
+      }
+    }
+  },
+  "security": [
+    {
+      "apikey": []
+    }
+  ],
+  "paths": {
+    "/business/getCatalog/{instanceName}": {
+      "post": {
+        "tags": [
+          "Business"
+        ],
+        "summary": "Get WhatsApp Business catalog",
+        "description": "Fetches all products from a WhatsApp Business catalog with automatic pagination",
+        "security": [
+          {
+            "apikey": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "instanceName",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Instance name"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CatalogRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Catalog retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/business/getCollections/{instanceName}": {
+      "post": {
+        "tags": [
+          "Business"
+        ],
+        "summary": "Get WhatsApp Business collections",
+        "description": "Fetches all collections with their products from a WhatsApp Business account",
+        "security": [
+          {
+            "apikey": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "instanceName",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Instance name"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CollectionsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Collections retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollectionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tags": []
+}
