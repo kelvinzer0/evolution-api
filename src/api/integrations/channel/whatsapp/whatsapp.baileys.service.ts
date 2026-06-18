@@ -4901,7 +4901,7 @@ export class BaileysStartupService extends ChannelStartupService {
   //Business Controller
   public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
-    const limit = data.limit || 50;
+    const limit = Number(data.limit) || 50;
     const cursor = data.cursor || null;
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
@@ -4971,7 +4971,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async fetchCollections(instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
-    const limit = data.limit || 100;
+    const limit = Number(data.limit) || 100;
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
 
