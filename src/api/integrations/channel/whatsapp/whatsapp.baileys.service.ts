@@ -4912,7 +4912,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       const info = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
-      const business = await this.fetchBusinessProfile(info?.jid);
+
+      let isBusiness = false;
+      try {
+        const business = await this.fetchBusinessProfile(info?.jid);
+        isBusiness = business?.isBusiness || false;
+      } catch (profileError) {
+        console.log('fetchBusinessProfile failed, continuing catalog fetch:', profileError?.message);
+      }
 
       let catalog = await this.getCatalog({ jid: info?.jid, limit, cursor });
       let nextPageCursor = catalog.nextPageCursor;
@@ -4939,7 +4946,7 @@ export class BaileysStartupService extends ChannelStartupService {
       return {
         wuid: info?.jid || jid,
         numberExists: info?.exists,
-        isBusiness: business.isBusiness,
+        isBusiness: isBusiness,
         catalogLength: productsCatalog.length,
         catalog: productsCatalog,
       };
@@ -4981,14 +4988,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       const info = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
-      const business = await this.fetchBusinessProfile(info?.jid);
+
+      let isBusiness = false;
+      try {
+        const business = await this.fetchBusinessProfile(info?.jid);
+        isBusiness = business?.isBusiness || false;
+      } catch (profileError) {
+        console.log('fetchBusinessProfile failed, continuing collections fetch:', profileError?.message);
+      }
+
       const collections = await this.getCollections(info?.jid, limit);
 
       return {
         wuid: info?.jid || jid,
         name: info?.name,
         numberExists: info?.exists,
-        isBusiness: business.isBusiness,
+        isBusiness: isBusiness,
         collectionsLength: collections?.length,
         collections: collections,
       };
