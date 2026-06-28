@@ -1,4 +1,4 @@
-import { getCollectionsDto } from '@api/dto/business.dto';
+import { getCatalogDto, getCollectionsDto } from '@api/dto/business.dto';
 import { OfferCallDto } from '@api/dto/call.dto';
 import {
   ArchiveChatDto,
@@ -4899,7 +4899,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   //Business Controller
-   public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
+   public async fetchCatalog(instanceName: string, data: getCatalogDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = Number(data.limit) || 50;
     // Tetap hormati cursor dari caller (untuk resume manual jika diperlukan)
