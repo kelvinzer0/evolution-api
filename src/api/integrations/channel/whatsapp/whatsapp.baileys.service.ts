@@ -4899,20 +4899,21 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   //Business Controller
-  public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
+   public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = Number(data.limit) || 50;
-    const cursor = data.cursor || null;
-
+    // Tetap hormati cursor dari caller (untuk resume manual jika diperlukan)
+    let cursor = data.cursor || null;
+  
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
-
+  
     if (!onWhatsapp.exists) {
       throw new BadRequestException(onWhatsapp);
     }
-
+  
     try {
       const info = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
-
+  
       let isBusiness = false;
       try {
         const business = await this.fetchBusinessProfile(info?.jid);
@@ -4920,42 +4921,54 @@ export class BaileysStartupService extends ChannelStartupService {
       } catch (profileError) {
         console.log('fetchBusinessProfile failed, continuing catalog fetch:', profileError?.message);
       }
-
-      let catalog = await this.getCatalog({ jid: info?.jid, limit, cursor });
-      let nextPageCursor = catalog.nextPageCursor;
-      let nextPageCursorJson = nextPageCursor ? JSON.parse(atob(nextPageCursor)) : null;
-      let pagination = nextPageCursorJson?.pagination_cursor
-        ? JSON.parse(atob(nextPageCursorJson.pagination_cursor))
-        : null;
-      let fetcherHasMore = pagination?.fetcher_has_more === true ? true : false;
-
-      let productsCatalog = catalog.products || [];
+  
+      let productsCatalog: Product[] = [];
+      let fetcherHasMore = true;
       let countLoops = 0;
-      while (fetcherHasMore && countLoops < 20) {
-        catalog = await this.getCatalog({ jid: info?.jid, limit, cursor: nextPageCursor });
-        nextPageCursor = catalog.nextPageCursor;
-        nextPageCursorJson = nextPageCursor ? JSON.parse(atob(nextPageCursor)) : null;
-        pagination = nextPageCursorJson?.pagination_cursor
+      const MAX_LOOPS = 200; // ~10.000 produk @50/halaman — cukup besar untuk hampir semua kasus nyata
+      let truncated = false;
+  
+      while (fetcherHasMore) {
+        const catalog = await this.getCatalog({ jid: info?.jid, limit, cursor });
+  
+        productsCatalog = [...productsCatalog, ...(catalog.products || [])];
+  
+        const nextPageCursor = catalog.nextPageCursor;
+        const nextPageCursorJson = nextPageCursor ? JSON.parse(atob(nextPageCursor)) : null;
+        const pagination = nextPageCursorJson?.pagination_cursor
           ? JSON.parse(atob(nextPageCursorJson.pagination_cursor))
           : null;
-        fetcherHasMore = pagination?.fetcher_has_more === true ? true : false;
-        productsCatalog = [...productsCatalog, ...catalog.products];
+  
+        fetcherHasMore = pagination?.fetcher_has_more === true;
+        cursor = nextPageCursor;
         countLoops++;
+  
+        // Safety valve: hindari infinite loop kalau WhatsApp API berkelakuan aneh
+        if (countLoops >= MAX_LOOPS) {
+          truncated = fetcherHasMore; // hanya benar2 "truncated" kalau memang masih ada sisa
+          this.logger.warn(
+            `fetchCatalog: mencapai MAX_LOOPS (${MAX_LOOPS}) untuk ${info?.jid}, ` +
+            `hasil mungkin belum lengkap. Gunakan 'cursor' di response untuk lanjut.`,
+          );
+          break;
+        }
       }
-
+  
       return {
         wuid: info?.jid || jid,
         numberExists: info?.exists,
-        isBusiness: isBusiness,
+        isBusiness,
         catalogLength: productsCatalog.length,
         catalog: productsCatalog,
+        truncated,           // <-- penanda eksplisit ke caller
+        nextCursor: truncated ? cursor : null,  // <-- supaya caller bisa lanjut manual
       };
     } catch (error) {
       console.log(error);
-      return { wuid: jid, name: null, isBusiness: false };
+      return { wuid: jid, name: null, isBusiness: false, catalog: [], truncated: true };
     }
   }
-
+  
   public async getCatalog({
     jid,
     limit,
