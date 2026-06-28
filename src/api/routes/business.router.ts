@@ -1,5 +1,6 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
-import { NumberDto } from '@api/dto/chat.dto';
+import { getCatalogDto } from '@api/dto/business.dto';
+import { getCollectionsDto } from '@api/dto/business.dto';
 import { businessController } from '@api/server.module';
 import { createMetaErrorResponse } from '@utils/errorResponse';
 import { catalogSchema, collectionsSchema } from '@validate/validate.schema';
@@ -53,10 +54,10 @@ export class BusinessRouter extends RouterBroker {
        */
       .post(this.routerPath('getCatalog'), ...guards, async (req, res) => {
         try {
-          const response = await this.dataValidate<NumberDto>({
+          const response = await this.dataValidate<getCatalogDto>({
             request: req,
             schema: catalogSchema,
-            ClassRef: NumberDto,
+            ClassRef: getCatalogDto,
             execute: (instance, data) => businessController.fetchCatalog(instance, data),
           });
 
@@ -109,10 +110,10 @@ export class BusinessRouter extends RouterBroker {
        */
       .post(this.routerPath('getCollections'), ...guards, async (req, res) => {
         try {
-          const response = await this.dataValidate<NumberDto>({
+          const response = await this.dataValidate<getCollectionsDto>({
             request: req,
             schema: collectionsSchema,
-            ClassRef: NumberDto,
+            ClassRef: getCollectionsDto,
             execute: (instance, data) => businessController.fetchCollections(instance, data),
           });
 
