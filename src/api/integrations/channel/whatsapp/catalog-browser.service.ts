@@ -348,24 +348,15 @@ export class BrowserCatalogService {
       state.pairingCode = null;
     });
 
-    client.on('ready', async () => {
+    client.on('ready', () => {
       this.logger.log(`[browser] Client ready for instance=${instanceName}`);
       state.ready = true;
       state.qrCode = null;
       state.pairingCode = null;
-
-      // Inject @wppconnect/wa-js into the page — whatsapp-web.js does NOT
-      // auto-inject it. Without this, window.WPP is undefined and all
-      // catalog/collection fetch logic fails silently.
-      // (Same approach as bedones-whatsapp's injectWPPIntoPageInternal)
-      try {
-        const page = client.pupPage;
-        if (page) {
-          await this.injectWaJs(page);
-        }
-      } catch (err) {
-        this.logger.warn(`[browser] Failed to inject wa-js on ready: ${(err as Error).message}`);
-      }
+      // Note: wa-js injection is done lazily in fetchCatalog/fetchCollections,
+      // NOT here. Calling injectWaJs here causes a race condition with the
+      // injectWaJs call in fetchCatalog — two concurrent page.evaluate(waJsCode)
+      // calls corrupt the page state, resulting in window.WPP = undefined.
     });
 
     client.on('auth_failure', (msg: string) => {
