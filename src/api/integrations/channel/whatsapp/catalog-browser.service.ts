@@ -548,9 +548,7 @@ export class BrowserCatalogService {
       const catalog = Array.from(productsById.values()).map((p: any) => {
         let plain: any = {};
         try {
-          plain = JSON.parse(
-            JSON.stringify(p, (_k, v) => (typeof v === 'function' ? undefined : v)),
-          );
+          plain = JSON.parse(JSON.stringify(p, (_k, v) => (typeof v === 'function' ? undefined : v)));
         } catch {
           plain = p;
         }
@@ -561,16 +559,10 @@ export class BrowserCatalogService {
           description: plain.description || p.description || '',
           url: plain.url || p.url || '',
           currency: plain.currency || p.currency || '',
-          price:
-            plain.price != null
-              ? String(plain.price)
-              : p.price != null
-                ? String(p.price)
-                : '',
+          price: plain.price != null ? String(plain.price) : p.price != null ? String(p.price) : '',
           is_hidden: plain.is_hidden || p.is_hidden || false,
           is_sanctioned: plain.is_sanctioned || p.is_sanctioned || false,
-          max_available:
-            plain.max_available != null ? String(plain.max_available) : '',
+          max_available: plain.max_available != null ? String(plain.max_available) : '',
           imageCdnUrl: plain.imageCdnUrl || plain.image_cdn_url || '',
           additionalImageCdnUrl: plain.additionalImageCdnUrl || plain.additional_image_cdn_urls || [],
         };
