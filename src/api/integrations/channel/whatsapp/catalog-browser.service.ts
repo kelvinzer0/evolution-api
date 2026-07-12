@@ -24,6 +24,10 @@
  *   (Kelvin Yuli Andrian's own implementation, which proves this works)
  */
 
+import { existsSync, unlinkSync } from 'fs';
+import { join } from 'path';
+import { execSync } from 'child_process';
+
 import { Logger } from '@config/logger.config';
 import { BadRequestException } from '@exceptions';
 import puppeteer, { Browser, Page } from 'puppeteer-core';
@@ -520,6 +524,11 @@ export class BrowserCatalogService {
     const userDataDir = this.sessionStore.userDataDir(instanceName);
     this.logger.log(`[browser] Launching Chromium for instance=${instanceName} jid=${jid}`);
 
+    // Clean up stale SingletonLock file from previous crashed launches.
+    // Chromium creates this lock file to prevent concurrent profile access,
+    // but if a previous process crashed, the lock stays and blocks new launches.
+    this.cleanStaleLocks(userDataDir);
+
     const browser = await puppeteer.launch({
       executablePath: this.config.executablePath,
       headless: this.config.headless,
@@ -527,9 +536,23 @@ export class BrowserCatalogService {
       args: this.config.extraArgs,
       defaultViewport: { width: 1280, height: 800 },
       ignoreDefaultArgs: ['--enable-automation'],
+      // Wait for initial page to be ready before returning
+      protocolTimeout: 60000,
     });
 
     this.browsers.set(jid, browser);
+
+    // Handle unexpected browser disconnect — clean up so next call can re-launch
+    browser.on('disconnected', () => {
+      this.logger.warn(`[browser] Browser disconnected for jid=${jid}, cleaning up`);
+      this.browsers.delete(jid);
+      const timer = this.idleTimers.get(jid);
+      if (timer) {
+        clearTimeout(timer);
+        this.idleTimers.delete(jid);
+      }
+      this.pendingQr.delete(jid);
+    });
 
     // Navigate to WA Web on the first page
     const page = await browser.newPage();
@@ -600,6 +623,40 @@ export class BrowserCatalogService {
     }, this.config.idleTimeoutMs);
 
     this.idleTimers.set(jid, timer);
+  }
+
+  /**
+   * Remove stale Chromium lock files and kill orphan Chromium processes
+   * left over from previous crashed launches.
+   *
+   * Chromium creates SingletonLock, SingletonCookie, and SingletonSocket
+   * symlinks in the userDataDir. If a previous process crashed, these
+   * locks persist and block new launches with "profile appears to be in
+   * use by another Chromium process" error.
+   */
+  private cleanStaleLocks(userDataDir: string): void {
+    // 1. Remove lock files/symlinks
+    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+    for (const lockFile of lockFiles) {
+      const lockPath = join(userDataDir, lockFile);
+      if (existsSync(lockPath)) {
+        try {
+          unlinkSync(lockPath);
+          this.logger.log(`[browser] Removed stale lock: ${lockFile}`);
+        } catch (err) {
+          this.logger.warn(`[browser] Failed to remove ${lockFile}: ${(err as Error).message}`);
+        }
+      }
+    }
+
+    // 2. Kill orphan chromium processes (best-effort, ignore errors)
+    // This handles the case where a previous Puppeteer crash left
+    // chromium processes running and holding the profile.
+    try {
+      execSync('pkill -f chromium 2>/dev/null || true', { timeout: 5000 });
+    } catch {
+      // pkill exit code 1 = no process matched, ignore
+    }
   }
 
   /**
