@@ -146,6 +146,29 @@ export class BrowserCatalogService {
   }
 
   /**
+   * Sanitize an instance name into a valid LocalAuth clientId.
+   *
+   * whatsapp-web.js LocalAuth requires clientId to be alphanumeric + underscore
+   * + hyphen only. Instance names like "Warung Lakku" (with space) are rejected
+   * with "Invalid clientId" error.
+   *
+   * Strategy: replace any non-alphanumeric char with a hyphen, collapse
+   * consecutive hyphens, and trim leading/trailing hyphens.
+   *
+   * Examples:
+   *   "Warung Lakku"     → "Warung-Lakku"
+   *   "kelvincruv"       → "kelvincruv"
+   *   "Hobi Haus"        → "Hobi-Haus"
+   *   "My Instance #1!"  → "My-Instance-1"
+   */
+  private sanitizeClientId(instanceName: string): string {
+    return instanceName
+      .replace(/[^a-zA-Z0-9_-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  /**
    * Clean stale Chromium lock files left by previous crashed sessions.
    */
   private cleanStaleLocks(dir: string): void {
@@ -213,7 +236,7 @@ export class BrowserCatalogService {
 
     const client = new Client({
       authStrategy: new LocalAuth({
-        clientId: instanceName,
+        clientId: this.sanitizeClientId(instanceName),
         dataPath: userDataDir,
       }),
       puppeteer: {
@@ -568,9 +591,26 @@ export class BrowserCatalogService {
       throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
     }
 
+    // Validate phone format: international, digits only (no +, no spaces)
+    if (!phoneNumber || !/^\d{6,15}$/.test(phoneNumber)) {
+      throw new BadRequestException(
+        'Invalid phone number. Must be international format, digits only (e.g. "6285733556953" for Indonesia). ' +
+          'No "+", spaces, or hyphens.',
+      );
+    }
+
     const state = await this.getReadyClient(instanceName);
-    // requestPairingCode works even before 'ready' event (it's needed for auth)
-    // whatsapp-web.js will trigger 'code_received' event with the code
+
+    // If already authenticated, no need for pairing code
+    if (state.ready) {
+      throw new BadRequestException(
+        `Instance "${instanceName}" browser session is already authenticated. No pairing code needed.`,
+      );
+    }
+
+    // requestPairingCode requires the client to be in UNPAIRED state (socket connected
+    // but not yet authenticated). The 'qr' event guarantees this state.
+    // getReadyClient resolves on 'qr' or 'ready', so we should be safe here.
     const code = await state.client.requestPairingCode(phoneNumber);
     state.pairingCode = code;
     this.logger.log(`[browser] Pairing code requested for instance=${instanceName} phone=${phoneNumber}: ${code}`);
@@ -584,15 +624,26 @@ export class BrowserCatalogService {
     ready: boolean;
     qrCode: string | null;
     pairingCode: string | null;
+    userId: string | null;
   } {
     const state = this.clients.get(instanceName);
     if (!state) {
-      return { ready: false, qrCode: null, pairingCode: null };
+      return { ready: false, qrCode: null, pairingCode: null, userId: null };
+    }
+    // Extract userId from client.info if available (set after 'ready' event)
+    let userId: string | null = null;
+    try {
+      if (state.ready && state.client?.info?.wid) {
+        userId = state.client.info.wid._serialized || null;
+      }
+    } catch {
+      // client.info may not be available yet
     }
     return {
       ready: state.ready,
       qrCode: state.qrCode,
       pairingCode: state.pairingCode,
+      userId,
     };
   }
 
