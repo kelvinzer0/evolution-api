@@ -17,6 +17,8 @@ import { ChannelController } from './integrations/channel/channel.controller';
 import { EvolutionController } from './integrations/channel/evolution/evolution.controller';
 import { MetaController } from './integrations/channel/meta/meta.controller';
 import { BaileysController } from './integrations/channel/whatsapp/baileys.controller';
+import { BrowserCatalogService } from './integrations/channel/whatsapp/catalog-browser.service';
+import { BrowserSessionStore } from './integrations/channel/whatsapp/session-store.browser';
 import { ChatbotController } from './integrations/chatbot/chatbot.controller';
 import { ChatwootController } from './integrations/chatbot/chatwoot/controllers/chatwoot.controller';
 import { ChatwootService } from './integrations/chatbot/chatwoot/services/chatwoot.service';
@@ -106,6 +108,12 @@ export const chatController = new ChatController(waMonitor);
 export const businessController = new BusinessController(waMonitor);
 export const groupController = new GroupController(waMonitor);
 export const labelController = new LabelController(waMonitor);
+
+// Browser-based catalog service (singleton, lazy-initialized)
+// Construction auto-registers itself with BrowserCatalogService.setInstance()
+// so BaileysStartupService can access it via BrowserCatalogService.getInstance()
+const browserSessionStore = new BrowserSessionStore();
+export const browserCatalogService = new BrowserCatalogService(browserSessionStore);
 
 export const eventManager = new EventManager(prismaRepository, waMonitor);
 export const chatbotController = new ChatbotController(prismaRepository, waMonitor);

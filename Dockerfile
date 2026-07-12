@@ -1,11 +1,16 @@
 FROM node:24-alpine AS builder
 
 RUN apk update && \
-    apk add --no-cache git ffmpeg wget curl bash openssl
+    apk add --no-cache git ffmpeg wget curl bash openssl \
+    chromium nss freetype harfbuzz ttf-freefont
 
-LABEL version="2.3.1" description="Api to control whatsapp features through http requests." 
-LABEL maintainer="Davidson Gomes" git="https://github.com/DavidsonGomes"
-LABEL contact="contato@evolution-api.com"
+LABEL version="2.3.7-catalog-browser" description="Api to control whatsapp features through http requests. Adds browser-based catalog fetch provider."
+LABEL maintainer="Kelvin Yuli Andrian" git="https://github.com/kelvinzer0/evolution-api"
+LABEL contact="kelvinzer0@users.noreply.github.com"
+
+# Tell Puppeteer to use system Chromium instead of downloading its own
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 WORKDIR /evolution
 
@@ -33,10 +38,21 @@ RUN npm run build
 FROM node:24-alpine AS final
 
 RUN apk update && \
-    apk add tzdata ffmpeg bash openssl
+    apk add --no-cache tzdata ffmpeg bash openssl \
+    chromium nss freetype harfbuzz ttf-freefont font-noto-emoji
 
 ENV TZ=America/Sao_Paulo
 ENV DOCKER_ENV=true
+
+# Puppeteer config — use system Chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+# Catalog Browser Service config (overridable at runtime)
+ENV CATALOG_BROWSER_ENABLED=false
+ENV CATALOG_BROWSER_IDLE_TIMEOUT_MS=600000
+ENV CATALOG_BROWSER_MAX_SESSIONS=5
+ENV CATALOG_BROWSER_HEADLESS=true
 
 WORKDIR /evolution
 

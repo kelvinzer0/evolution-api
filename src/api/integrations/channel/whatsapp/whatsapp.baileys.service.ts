@@ -153,6 +153,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { BrowserCatalogService } from './catalog-browser.service';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -4900,6 +4901,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
   //Business Controller
    public async fetchCatalog(instanceName: string, data: getCatalogDto) {
+    // === Provider routing: browser fallback for full catalog ===
+    if (data.provider === 'browser') {
+      const jid = data.number ? createJid(data.number) : this.client?.user?.id;
+      return BrowserCatalogService.fetchCatalogOrThrow({
+        jid,
+        instanceName,
+        pageSize: Number(data.limit) || 50,
+      });
+    }
+    // === End provider routing ===
+
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = Number(data.limit) || 50;
     // Tetap hormati cursor dari caller (untuk resume manual jika diperlukan)
@@ -4990,6 +5002,17 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async fetchCollections(instanceName: string, data: getCollectionsDto) {
+    // === Provider routing: browser fallback for full collections ===
+    if (data.provider === 'browser') {
+      const jid = data.number ? createJid(data.number) : this.client?.user?.id;
+      return BrowserCatalogService.fetchCollectionsOrThrow({
+        jid,
+        instanceName,
+        limit: Number(data.limit) || 100,
+      });
+    }
+    // === End provider routing ===
+
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = Number(data.limit) || 100;
 
