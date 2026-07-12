@@ -126,7 +126,8 @@
     "swagger-ui-express": "^5.0.1",
     "tsup": "^8.3.5",
     "undici": "^7.16.0",
-    "uuid": "^13.0.0"
+    "uuid": "^13.0.0",
+    "@wppconnect/wa-js": "^3.22.1"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.8.1",

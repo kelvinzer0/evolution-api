@@ -556,15 +556,62 @@ export class BrowserCatalogService {
 
     // Navigate to WA Web on the first page
     const page = await browser.newPage();
+    await page.setUserAgent(
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    );
     await page.goto('https://web.whatsapp.com/', {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
+      waitUntil: 'networkidle2',
+      timeout: 90000,
     });
 
-    // Give WA Web time to initialize
-    await new Promise((r) => setTimeout(r, 5000));
+    // Inject @wppconnect/wa-js library — required to access window.WPP API
+    // (whatsapp-web.js bundles this, but since we use puppeteer-core directly,
+    // we need to inject it ourselves)
+    await this.injectWaJs(page);
 
     return browser;
+  }
+
+  /**
+   * Inject @wppconnect/wa-js into the page and wait for WPP.isReady.
+   * This library provides the window.WPP API we use for catalog fetching.
+   */
+  private async injectWaJs(page: Page): Promise<void> {
+    const wppExists = await page.evaluate(() => typeof (window as any).WPP !== 'undefined');
+    if (wppExists) {
+      this.logger.log('[browser] WPP already loaded in page');
+      return;
+    }
+
+    this.logger.log('[browser] Injecting @wppconnect/wa-js into page...');
+
+    // Read wa-js from node_modules and inject via page.evaluate
+    try {
+      const waJsPath = require.resolve('@wppconnect/wa-js');
+      const fs = await import('fs');
+      const waJsCode = fs.readFileSync(waJsPath, 'utf8');
+      await page.evaluate(waJsCode);
+      this.logger.log(`[browser] wa-js injected (${waJsCode.length} chars)`);
+    } catch (err) {
+      this.logger.error(`[browser] Failed to inject wa-js: ${(err as Error).message}`);
+      throw new BadRequestException(
+        'Failed to inject @wppconnect/wa-js. Make sure it is installed: npm install @wppconnect/wa-js',
+      );
+    }
+
+    // Wait for WPP to be ready
+    try {
+      await page.waitForFunction(
+        () => (window as any).WPP && (window as any).WPP.isReady === true,
+        { timeout: 30000 },
+      );
+      this.logger.log('[browser] WPP.isReady = true');
+    } catch (err) {
+      this.logger.warn('[browser] WPP.isReady timeout — continuing anyway');
+    }
+
+    // Give WA Web + WPP a few more seconds to stabilize
+    await new Promise((r) => setTimeout(r, 5000));
   }
 
   /**
