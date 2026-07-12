@@ -230,7 +230,6 @@ export class BrowserCatalogService {
         executablePath: this.config.executablePath,
         headless: this.config.headless,
         args: this.config.extraArgs,
-        // @ts-expect-error - bypassCSP is supported by whatsapp-web.js puppeteer config but not in puppeteer types
         bypassCSP: true,
       },
     });
@@ -265,12 +264,22 @@ export class BrowserCatalogService {
       this.clients.delete(instanceName);
     });
 
-    // Create readyPromise that resolves when 'ready' event fires
+    // Create readyPromise that resolves when EITHER 'qr' OR 'ready' event fires.
+    // - 'qr' means client needs authentication (return QR to caller)
+    // - 'ready' means client is authenticated and operational
+    // Either way, the caller can proceed (either show QR or fetch catalog).
+    // Timeout: 120s — if neither fires, something is wrong (network issue etc.)
     state.readyPromise = new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error(`Client initialization timed out after 120s for instance=${instanceName}`));
       }, 120000);
 
+      client.once('qr', () => {
+        clearTimeout(timeout);
+        // Don't resolve immediately — wait a tick to ensure state.qrCode is set
+        // in the 'qr' event handler above before resolving.
+        setTimeout(() => resolve(), 100);
+      });
       client.once('ready', () => {
         clearTimeout(timeout);
         resolve();

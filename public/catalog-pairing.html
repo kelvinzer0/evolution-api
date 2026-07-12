@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Catalog Browser Auth — Evolution API</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f0f2f5;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+      max-width: 700px;
+      margin: 0 auto;
+    }
+    h1 { color: #128c7e; margin-bottom: 4px; font-size: 22px; }
+    .subtitle { color: #666; margin-bottom: 24px; font-size: 13px; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; color: #333; font-size: 13px; }
+    input, select {
+      width: 100%;
+      padding: 10px 14px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+    input:focus, select:focus { outline: none; border-color: #128c7e; }
+    .btn-group { display: flex; gap: 8px; margin: 20px 0; }
+    button {
+      flex: 1;
+      padding: 12px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #128c7e; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #0e6b5e; }
+    .btn-secondary { background: #6c757d; color: white; }
+    .btn-secondary:hover:not(:disabled) { background: #5a6268; }
+    .btn-danger { background: #dc3545; color: white; }
+    .btn-danger:hover:not(:disabled) { background: #c82333; }
+    .status {
+      padding: 14px 18px;
+      border-radius: 8px;
+      margin: 16px 0;
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .status.info { background: #d1ecf1; color: #0c5460; }
+    .status.success { background: #d4edda; color: #155724; }
+    .status.error { background: #f8d7da; color: #721c24; }
+    .status.waiting { background: #fff3cd; color: #856404; }
+    .code-display {
+      background: linear-gradient(135deg, #128c7e 0%, #25d366 100%);
+      color: white;
+      padding: 28px 24px;
+      border-radius: 12px;
+      margin: 16px 0;
+      font-family: 'Courier New', monospace;
+      font-size: 38px;
+      font-weight: bold;
+      letter-spacing: 8px;
+      text-align: center;
+      box-shadow: 0 4px 15px rgba(18,140,126,0.3);
+    }
+    .code-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      opacity: 0.9;
+      margin-bottom: 8px;
+      letter-spacing: 1px;
+      text-align: center;
+    }
+    .qr-display {
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      margin: 16px 0;
+      text-align: center;
+      border: 2px solid #e0e0e0;
+    }
+    .qr-display img { max-width: 280px; width: 100%; height: auto; }
+    .instructions {
+      background: #e7f4ff;
+      padding: 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #075985;
+      line-height: 1.6;
+      margin-top: 16px;
+    }
+    .instructions ol { padding-left: 20px; }
+    .instructions li { margin-bottom: 4px; }
+    .instructions strong { color: #075985; }
+    .meta { font-size: 11px; color: #999; margin-top: 12px; text-align: center; }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #ccc;
+      border-top-color: #856404;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .hidden { display: none; }
+    .api-key-section {
+      background: #f8f9fa;
+      padding: 14px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-size: 12px;
+      color: #666;
+    }
+    .api-key-section code {
+      background: #e9ecef;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Catalog Browser Auth</h1>
+    <div class="subtitle">WhatsApp Web session authentication for browser-based catalog fetch</div>
+
+    <div class="api-key-section">
+      <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="apikey" placeholder="Evolution API key" />
+      </div>
+      <div class="form-group">
+        <label>Instance Name</label>
+        <select id="instance"><option value="">Loading...</option></select>
+      </div>
+    </div>
+
+    <div id="status" class="status info hidden"></div>
+
+    <div id="qr-section" class="hidden">
+      <div class="code-label">QR Code — Scan with WhatsApp</div>
+      <div class="qr-display"><img id="qr-img" alt="QR Code" /></div>
+    </div>
+
+    <div id="code-section" class="hidden">
+      <div class="code-label">Pairing Code — Enter on your phone</div>
+      <div id="code" class="code-display">--------</div>
+    </div>
+
+    <div class="form-group">
+      <label>Phone Number (for pairing code, international format, digits only)</label>
+      <input type="tel" id="phone" placeholder="6285733556953" />
+    </div>
+
+    <div class="btn-group">
+      <button class="btn-primary" id="btn-pair" onclick="requestPairingCode()">Request Pairing Code</button>
+      <button class="btn-secondary" id="btn-qr" onclick="showQr()">Show QR Code</button>
+      <button class="btn-danger" id="btn-logout" onclick="logoutBrowser()">Logout</button>
+    </div>
+
+    <div class="instructions">
+      <strong>How to authenticate (choose one method):</strong>
+      <ol>
+        <li><strong>Pairing Code (recommended):</strong> Enter your phone number above (international format, e.g. 6285733556953), click "Request Pairing Code". An 8-character code will appear. On your phone: WhatsApp → Settings → Linked Devices → Link a Device → "Link with phone number instead" → Enter the code.</li>
+        <li><strong>QR Code:</strong> Click "Show QR Code". A QR will appear. On your phone: WhatsApp → Settings → Linked Devices → Link a Device → Scan the QR code with your camera.</li>
+        <li>After successful auth, this page will auto-detect and show "Authenticated". You can then use <code>POST /business/getCatalog/{instance}</code> with <code>{"provider":"browser"}</code> to fetch full catalog.</li>
+      </ol>
+    </div>
+
+    <div class="meta" id="meta">Ready.</div>
+  </div>
+
+<script>
+let pollInterval = null;
+let authCheckInterval = null;
+
+// Auto-fill API key from query param if present
+const urlParams = new URLSearchParams(window.location.search);
+if (urlParams.get('apikey')) {
+  document.getElementById('apikey').value = urlParams.get('apikey');
+}
+
+// Load instances on page load
+async function loadInstances() {
+  const apikey = document.getElementById('apikey').value;
+  if (!apikey) {
+    document.getElementById('instance').innerHTML = '<option value="">Enter API key first</option>';
+    return;
+  }
+  try {
+    const res = await fetch('/instance/fetchInstances', { headers: { apikey } });
+    if (!res.ok) throw new Error('Failed to fetch instances');
+    const data = await res.json();
+    const instances = Array.isArray(data) ? data : [];
+    const sel = document.getElementById('instance');
+    if (instances.length === 0) {
+      sel.innerHTML = '<option value="">No instances found</option>';
+    } else {
+      sel.innerHTML = instances.map(i => `<option value="${i.name}">${i.name} (${i.connectionStatus || '?'})</option>`).join('');
+    }
+  } catch (e) {
+    document.getElementById('instance').innerHTML = `<option value="">Error: ${e.message}</option>`;
+  }
+}
+
+document.getElementById('apikey').addEventListener('change', loadInstances);
+document.getElementById('apikey').addEventListener('input', () => {
+  // Debounce
+  clearTimeout(window._loadTimer);
+  window._loadTimer = setTimeout(loadInstances, 500);
+});
+loadInstances();
+
+function showStatus(className, html) {
+  const el = document.getElementById('status');
+  el.className = 'status ' + className;
+  el.innerHTML = html;
+  el.classList.remove('hidden');
+}
+
+function hideStatus() {
+  document.getElementById('status').classList.add('hidden');
+}
+
+function hideAll() {
+  document.getElementById('qr-section').classList.add('hidden');
+  document.getElementById('code-section').classList.add('hidden');
+}
+
+async function requestPairingCode() {
+  const apikey = document.getElementById('apikey').value;
+  const instance = document.getElementById('instance').value;
+  const phone = document.getElementById('phone').value.trim();
+
+  if (!apikey) return alert('API key required');
+  if (!instance) return alert('Select an instance');
+  if (!phone || !/^\d+$/.test(phone)) return alert('Phone number required (digits only, e.g. 6285733556953)');
+
+  document.getElementById('btn-pair').disabled = true;
+  document.getElementById('btn-pair').textContent = 'Requesting...';
+  hideAll();
+  showStatus('waiting', '<span class="spinner"></span>Launching browser & requesting pairing code (can take 30-60s on first launch)...');
+
+  try {
+    const res = await fetch(`/business/requestPairingCode/${encodeURIComponent(instance)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey },
+      body: JSON.stringify({ phone }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || data.error || 'Request failed');
+
+    document.getElementById('code').textContent = data.pairingCode;
+    document.getElementById('code-section').classList.remove('hidden');
+    showStatus('waiting', '<span class="spinner"></span>Pairing code ready. Enter it on your phone. Code expires in 60s.');
+    document.getElementById('meta').textContent = `Pairing code requested at ${new Date().toLocaleTimeString()}`;
+
+    // Start polling for auth status
+    startAuthPolling();
+  } catch (e) {
+    showStatus('error', 'Error: ' + e.message);
+  } finally {
+    document.getElementById('btn-pair').disabled = false;
+    document.getElementById('btn-pair').textContent = 'Request Pairing Code';
+  }
+}
+
+async function showQr() {
+  const apikey = document.getElementById('apikey').value;
+  const instance = document.getElementById('instance').value;
+
+  if (!apikey) return alert('API key required');
+  if (!instance) return alert('Select an instance');
+
+  document.getElementById('btn-qr').disabled = true;
+  document.getElementById('btn-qr').textContent = 'Loading...';
+  hideAll();
+  showStatus('waiting', '<span class="spinner"></span>Launching browser & waiting for QR code (can take 30-60s on first launch)...');
+
+  // Poll /getAuthState until qrCode appears
+  let attempts = 0;
+  const maxAttempts = 30; // 60 seconds total
+  const pollQr = async () => {
+    attempts++;
+    try {
+      const res = await fetch(`/business/getAuthState/${encodeURIComponent(instance)}?_=${Date.now()}`, {
+        headers: { apikey },
+      });
+      const data = await res.json();
+
+      if (data.ready) {
+        showStatus('success', '✓ Already authenticated! You can now fetch catalog with provider=browser.');
+        document.getElementById('btn-qr').disabled = false;
+        document.getElementById('btn-qr').textContent = 'Show QR Code';
+        return;
+      }
+
+      if (data.qrCode) {
+        document.getElementById('qr-img').src = data.qrCode;
+        document.getElementById('qr-section').classList.remove('hidden');
+        showStatus('waiting', '<span class="spinner"></span>QR Code ready. Scan with your phone WhatsApp → Linked Devices → Link a Device.');
+        document.getElementById('btn-qr').disabled = false;
+        document.getElementById('btn-qr').textContent = 'Refresh QR';
+        startAuthPolling();
+        return;
+      }
+
+      if (attempts < maxAttempts) {
+        setTimeout(pollQr, 2000);
+      } else {
+        showStatus('error', 'Timed out waiting for QR code. Check server logs.');
+        document.getElementById('btn-qr').disabled = false;
+        document.getElementById('btn-qr').textContent = 'Show QR Code';
+      }
+    } catch (e) {
+      showStatus('error', 'Poll error: ' + e.message);
+      document.getElementById('btn-qr').disabled = false;
+      document.getElementById('btn-qr').textContent = 'Show QR Code';
+    }
+  };
+
+  // First, trigger client launch by calling getCatalog (which will start browser session)
+  try {
+    await fetch(`/business/getCatalog/${encodeURIComponent(instance)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey },
+      body: JSON.stringify({ provider: 'browser' }),
+    });
+  } catch (e) {
+    // Ignore — the call may timeout while browser launches
+  }
+
+  pollQr();
+}
+
+function startAuthPolling() {
+  if (authCheckInterval) clearInterval(authCheckInterval);
+  authCheckInterval = setInterval(checkAuthStatus, 3000);
+  checkAuthStatus();
+}
+
+async function checkAuthStatus() {
+  const apikey = document.getElementById('apikey').value;
+  const instance = document.getElementById('instance').value;
+  if (!apikey || !instance) return;
+
+  try {
+    const res = await fetch(`/business/getAuthState/${encodeURIComponent(instance)}?_=${Date.now()}`, {
+      headers: { apikey },
+    });
+    const data = await res.json();
+
+    if (data.ready) {
+      clearInterval(authCheckInterval);
+      authCheckInterval = null;
+      hideAll();
+      showStatus('success', `✓ AUTHENTICATED! User: ${data.userId || 'unknown'}. Session saved. You can now fetch catalog with <code>{"provider":"browser"}</code>.`);
+      document.getElementById('meta').textContent = `Authenticated at ${new Date().toLocaleTimeString()}`;
+    } else if (data.qrCode && !document.getElementById('qr-section').classList.contains('hidden')) {
+      // Update QR if it changed
+      document.getElementById('qr-img').src = data.qrCode;
+    }
+  } catch (e) {
+    // Ignore poll errors
+  }
+}
+
+async function logoutBrowser() {
+  const apikey = document.getElementById('apikey').value;
+  const instance = document.getElementById('instance').value;
+  if (!apikey || !instance) return alert('API key and instance required');
+  if (!confirm(`Delete browser session for instance "${instance}"?`)) return;
+
+  try {
+    const res = await fetch(`/business/logoutBrowser/${encodeURIComponent(instance)}`, {
+      method: 'DELETE',
+      headers: { apikey },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || data.error || 'Logout failed');
+    hideAll();
+    if (authCheckInterval) { clearInterval(authCheckInterval); authCheckInterval = null; }
+    showStatus('info', 'Browser session deleted. Next catalog fetch will require new auth.');
+  } catch (e) {
+    showStatus('error', 'Logout error: ' + e.message);
+  }
+}
+</script>
+</body>
+</html>
