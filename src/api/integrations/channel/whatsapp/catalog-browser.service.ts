@@ -391,6 +391,12 @@ export class BrowserCatalogService {
       throw new BadRequestException('WhatsApp Web page not available');
     }
 
+    // Ensure wa-js is injected before fetching catalog.
+    // (injectWaJs is idempotent — skips if WPP already loaded.
+    // This fixes a race condition where readyPromise resolves before
+    // the 'ready' event handler's injectWaJs call completes.)
+    await this.injectWaJs(page);
+
     const result = await page.evaluate(
       async (): Promise<{
         catalog: BrowserProduct[];
@@ -534,6 +540,9 @@ export class BrowserCatalogService {
     if (!page) {
       throw new BadRequestException('WhatsApp Web page not available');
     }
+
+    // Ensure wa-js is injected before fetching collections (idempotent).
+    await this.injectWaJs(page);
 
     const result = await page.evaluate(
       async (): Promise<{
