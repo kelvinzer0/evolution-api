@@ -75,6 +75,7 @@
     "@prisma/client": "^6.16.2",
     "@sentry/node": "^10.12.0",
     "@types/uuid": "^10.0.0",
+    "@wppconnect/wa-js": "^3.22.1",
     "amqplib": "^0.10.5",
     "audio-decode": "^2.2.3",
     "axios": "^1.7.9",
@@ -112,7 +113,6 @@
     "openai": "^4.77.3",
     "pg": "^8.13.1",
     "pino": "^9.10.0",
-    "puppeteer-core": "^23.11.1",
     "prisma": "^6.1.0",
     "pusher": "^5.2.0",
     "qrcode": "^1.5.4",
@@ -127,7 +127,7 @@
     "tsup": "^8.3.5",
     "undici": "^7.16.0",
     "uuid": "^13.0.0",
-    "@wppconnect/wa-js": "^3.22.1"
+    "whatsapp-web.js": "^1.34.7"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.8.1",

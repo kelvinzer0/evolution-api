@@ -1,36 +1,32 @@
 /**
  * BrowserCatalogService
  * ---------------------------------------------------------------------
- * Singleton service that lazily launches a Puppeteer browser per WhatsApp
- * account (JID) to fetch catalog & collections via the internal
- * `window.WPP.whatsapp.functions.queryCatalog` API of web.whatsapp.com.
+ * Singleton service that uses whatsapp-web.js to fetch catalog & collections
+ * via web.whatsapp.com, bypassing Baileys' protocol-level truncation.
  *
  * Why this exists:
- *   WhatsApp's anti-bot/anti-scraping on the protocol level (Baileys)
- *   is very strict and causes `getCatalog()` to truncate results. The
- *   same catalog fetched via web.whatsapp.com (browser automation)
- *   returns the full list because WhatsApp's own frontend code handles
- *   pagination correctly.
+ *   WhatsApp's anti-bot/anti-scraping on the protocol level (Baileys) is
+ *   very strict and causes `getCatalog()` to truncate results. The same
+ *   catalog fetched via web.whatsapp.com (browser automation) returns the
+ *   full list because WhatsApp's own frontend code handles pagination.
  *
- * Design:
- *   - One Browser instance per JID (lazy start)
- *   - Browser is killed after IDLE_TIMEOUT_MS of inactivity
- *   - Session is persisted on disk per instance (BrowserSessionStore)
- *   - If no session exists, returns a QR code the caller must surface
- *     to the user for scanning
+ * Implementation:
+ *   Uses whatsapp-web.js (same library as bedones-whatsapp, proven working).
+ *   - LocalAuth strategy for session persistence per instance
+ *   - Event-driven: 'qr', 'authenticated', 'ready', 'code_received' (pairing)
+ *   - Catalog fetch uses window.WPP API (auto-injected by whatsapp-web.js)
  *
  * Ported logic from:
  *   bedones-whatsapp/apps/whatsapp-connector/src/catalog/catalog.service.ts
- *   (Kelvin Yuli Andrian's own implementation, which proves this works)
  */
 
-import { existsSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { execSync } from 'child_process';
 
 import { Logger } from '@config/logger.config';
+import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException } from '@exceptions';
-import puppeteer, { Browser, Page } from 'puppeteer-core';
+import { Client, LocalAuth } from 'whatsapp-web.js';
 
 import {
   BrowserCatalogConfig,
@@ -41,239 +37,31 @@ import {
   BrowserCollectionsResult,
   BrowserProduct,
 } from './catalog-browser.types';
-import { BrowserSessionStore } from './session-store.browser';
 
-// Return types for in-page scripts (kept as named interfaces to avoid
-// TypeScript parser confusion with multi-line arrow type annotations)
-interface InPageCatalogResult {
-  catalog: BrowserProduct[];
-  message?: string;
-}
-
-interface InPageCollectionsResult {
-  collections: BrowserCollection[];
-  message?: string;
-}
-
-interface InPageReadyResult {
+// Per-instance client state
+interface InstanceClientState {
+  client: Client;
   ready: boolean;
-  reason?: string;
+  readyPromise: Promise<void>;
+  qrCode: string | null;
+  pairingCode: string | null;
+  lastActivity: number;
+  idleTimer?: NodeJS.Timeout;
 }
 
-// JavaScript executed inside the browser page context — has access to
-// window.WPP, window.Whatsapp, etc. Cannot reference any Node.js types.
-// NOTE: must be self-contained, no closures over outer variables.
-const FETCH_CATALOG_IN_PAGE = async (): Promise<InPageCatalogResult> => {
-  // Type-loose since we're running in the browser context
-  const wpp = (window as any).WPP;
-  if (!wpp) {
-    return { catalog: [], message: 'WPP not available — page did not load WhatsApp Web' };
-  }
+const SESSION_SUBDIR = 'browser-session';
 
-  const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-  const userId = (myUser && myUser._serialized) || '';
-  if (!userId) {
-    return { catalog: [], message: 'User ID not found — not logged in' };
-  }
-
-  const whatsappApi = wpp.whatsapp as any;
-  const productsById = new Map<string, BrowserProduct>();
-
-  const addProduct = (rawProduct: any) => {
-    const product = rawProduct?.attributes || rawProduct;
-    if (!product?.id) return;
-    if (!productsById.has(product.id)) {
-      productsById.set(product.id, product as BrowserProduct);
-    }
-  };
-
-  const extractProductsFromCatalog = (catalogEntry: any): any[] => {
-    if (!catalogEntry) return [];
-    const productIndex = catalogEntry.productCollection?._index;
-    if (!productIndex || typeof productIndex !== 'object') return [];
-    return Object.keys(productIndex)
-      .map((productId) => productIndex[productId]?.attributes)
-      .filter(Boolean);
-  };
-
-  // Layer 1: queryCatalog with pagination cursor (most reliable)
-  if (whatsappApi?.functions?.queryCatalog) {
-    try {
-      let afterToken: string | undefined = undefined;
-      let safetyCount = 0;
-      while (safetyCount < 500) {
-        const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
-        const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
-        for (const product of pageProducts) {
-          addProduct(product);
-        }
-        const nextAfter = response?.paging?.cursors?.after;
-        if (!nextAfter || nextAfter === afterToken) break;
-        afterToken = nextAfter;
-        safetyCount++;
-      }
-    } catch (error: any) {
-      // queryCatalog unavailable on this WA version — fall through to next layer
-      console.log('queryCatalog unavailable:', error?.message);
-    }
-  }
-
-  // Layer 2: CatalogStore.findQuery (direct store access)
-  if (whatsappApi?.CatalogStore?.findQuery) {
-    try {
-      const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
-      if (Array.isArray(results)) {
-        for (const entry of results) {
-          const products = extractProductsFromCatalog(entry);
-          for (const product of products) {
-            addProduct(product);
-          }
-        }
-      }
-    } catch (error: any) {
-      console.log('CatalogStore.findQuery unavailable:', error?.message);
-    }
-  }
-
-  // Layer 3: WPP.catalog.getMyCatalog (fallback)
-  try {
-    const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
-    const fallbackProducts = extractProductsFromCatalog(myCatalog);
-    for (const product of fallbackProducts) {
-      addProduct(product);
-    }
-  } catch (error: any) {
-    console.log('getMyCatalog unavailable:', error?.message);
-  }
-
-  // Layer 4: last resort — getProducts with hardcoded cap
-  if (productsById.size === 0) {
-    try {
-      const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
-      if (Array.isArray(fallbackProducts)) {
-        for (const product of fallbackProducts) {
-          addProduct(product);
-        }
-      }
-    } catch (error: any) {
-      console.log('getProducts unavailable:', error?.message);
-    }
-  }
-
-  return { catalog: Array.from(productsById.values()) };
-};
-
-// In-page script: fetch all collections
-const FETCH_COLLECTIONS_IN_PAGE = async (): Promise<InPageCollectionsResult> => {
-  const wpp = (window as any).WPP;
-  if (!wpp) {
-    return { collections: [], message: 'WPP not available' };
-  }
-
-  const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-  const userId = (myUser && myUser._serialized) || '';
-  if (!userId) {
-    return { collections: [], message: 'User ID not found' };
-  }
-
-  const whatsappApi = wpp.whatsapp as any;
-  const collections: BrowserCollection[] = [];
-
-  // Method 1: WPP.catalog.getCollections (preferred)
-  try {
-    const result: any = await wpp.catalog?.getCollections?.(userId);
-    if (Array.isArray(result)) {
-      for (const c of result) {
-        const attrs = c?.attributes || c;
-        if (!attrs?.id) continue;
-        // Extract products from collection
-        const productIndex = c?.productCollection?._index || attrs?.products?._index;
-        const products: BrowserProduct[] = [];
-        if (productIndex && typeof productIndex === 'object') {
-          for (const pid of Object.keys(productIndex)) {
-            const p = productIndex[pid]?.attributes || productIndex[pid];
-            if (p) products.push(p as BrowserProduct);
-          }
-        }
-        collections.push({
-          id: attrs.id,
-          name: attrs.name || '',
-          products,
-          status: attrs.status,
-        });
-      }
-    }
-  } catch (error: any) {
-    console.log('WPP.catalog.getCollections failed:', error?.message);
-  }
-
-  // Method 2: CatalogStore fallback (direct store access)
-  if (collections.length === 0 && whatsappApi?.CollectionStore?.findQuery) {
-    try {
-      const results: any[] = await whatsappApi.CollectionStore.findQuery(userId);
-      if (Array.isArray(results)) {
-        for (const c of results) {
-          const attrs = c?.attributes || c;
-          if (!attrs?.id) continue;
-          const productIndex = c?.productCollection?._index;
-          const products: BrowserProduct[] = [];
-          if (productIndex && typeof productIndex === 'object') {
-            for (const pid of Object.keys(productIndex)) {
-              const p = productIndex[pid]?.attributes || productIndex[pid];
-              if (p) products.push(p as BrowserProduct);
-            }
-          }
-          collections.push({
-            id: attrs.id,
-            name: attrs.name || '',
-            products,
-            status: attrs.status,
-          });
-        }
-      }
-    } catch (error: any) {
-      console.log('CollectionStore.findQuery failed:', error?.message);
-    }
-  }
-
-  return { collections };
-};
-
-// In-page script: check if WA Web is ready
-const IS_WA_READY_IN_PAGE = async (): Promise<InPageReadyResult> => {
-  const wpp = (window as any).WPP;
-  if (!wpp) return { ready: false, reason: 'WPP not loaded' };
-  if (!wpp.isReady) {
-    try {
-      if (wpp.waitForReady) await wpp.waitForReady({ timeout: 30000 });
-    } catch {
-      return { ready: false, reason: 'WPP.waitForReady timed out' };
-    }
-  }
-  const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-  const userId = myUser ? myUser._serialized : null;
-  if (!userId) return { ready: false, reason: 'No user logged in (need QR scan)' };
-  return { ready: true };
-};
+// (No NestJS — Evolution API uses plain classes. The @Injectable decorator
+//  below is a no-op kept only for documentation purposes; remove if it causes
+//  issues. This class is constructed manually in server.module.ts.)
 
 export class BrowserCatalogService {
   private readonly logger = new Logger(BrowserCatalogService.name);
   private readonly config: BrowserCatalogConfig;
 
-  // Per-JID browser instance
-  private readonly browsers = new Map<string, Browser>();
-  // Per-JID idle timer
-  private readonly idleTimers = new Map<string, NodeJS.Timeout>();
-  // Per-JID QR code (when auth pending)
-  private readonly pendingQr = new Map<string, string>();
+  // Per-instance state map (key = instance name)
+  private readonly clients = new Map<string, InstanceClientState>();
 
-  /**
-   * Service locator — set by server.module.ts at bootstrap time so that
-   * the BaileysStartupService (which is NOT NestJS-managed) can access
-   * the singleton instance via `BrowserCatalogService.getInstance()`.
-   *
-   * Returns null if not initialized (e.g. when CATALOG_BROWSER_ENABLED=false).
-   */
   private static instance: BrowserCatalogService | null = null;
 
   static getInstance(): BrowserCatalogService | null {
@@ -284,7 +72,7 @@ export class BrowserCatalogService {
     BrowserCatalogService.instance = svc;
   }
 
-  constructor(private readonly sessionStore: BrowserSessionStore) {
+  constructor() {
     this.config = this.loadConfig();
     if (this.config.enabled) {
       this.logger.log(
@@ -294,10 +82,9 @@ export class BrowserCatalogService {
     BrowserCatalogService.setInstance(this);
   }
 
-  /**
-   * Convenience static method: fetch catalog via browser, or throw if disabled.
-   */
-  static async fetchCatalogOrThrow(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
+  static async fetchCatalogOrThrow(
+    options: BrowserCatalogOptions,
+  ): Promise<BrowserCatalogResult> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
       throw new BadRequestException(
@@ -307,10 +94,9 @@ export class BrowserCatalogService {
     return svc.fetchCatalog(options);
   }
 
-  /**
-   * Convenience static method: fetch collections via browser.
-   */
-  static async fetchCollectionsOrThrow(options: BrowserCollectionsOptions): Promise<BrowserCollectionsResult> {
+  static async fetchCollectionsOrThrow(
+    options: BrowserCollectionsOptions,
+  ): Promise<BrowserCollectionsResult> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
       throw new BadRequestException(
@@ -320,17 +106,17 @@ export class BrowserCatalogService {
     return svc.fetchCollections(options);
   }
 
-  /**
-   * Load configuration from env vars (with sane defaults).
-   */
   private loadConfig(): BrowserCatalogConfig {
     const enabled = (process.env.CATALOG_BROWSER_ENABLED || 'false').toLowerCase() === 'true';
     const idleTimeoutMs = parseInt(process.env.CATALOG_BROWSER_IDLE_TIMEOUT_MS || '600000', 10);
     const maxSessions = parseInt(process.env.CATALOG_BROWSER_MAX_SESSIONS || '5', 10);
     const headlessEnv = (process.env.CATALOG_BROWSER_HEADLESS || 'true').toLowerCase();
-    const headless: boolean | 'shell' = headlessEnv === 'shell' ? 'shell' : headlessEnv === 'false' ? false : true;
+    const headless: boolean | 'shell' =
+      headlessEnv === 'shell' ? 'shell' : headlessEnv === 'false' ? false : true;
     const executablePath =
-      process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
+      process.env.PUPPETEER_EXECUTABLE_PATH ||
+      process.env.CHROMIUM_PATH ||
+      '/usr/bin/chromium-browser';
 
     return {
       enabled,
@@ -355,375 +141,558 @@ export class BrowserCatalogService {
         '--disable-translate',
         '--disable-default-apps',
         '--disable-component-update',
+        '--disable-blink-features=AutomationControlled',
       ],
     };
   }
 
   /**
-   * Public entry: fetch catalog via browser.
-   * If session is not authenticated, returns a result with qrCode.
+   * Get the user-data directory for an instance's WhatsApp Web session.
    */
-  async fetchCatalog(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
-    if (!this.config.enabled) {
-      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
-    }
-
-    const { jid, instanceName } = options;
-    this.logger.log(`[browser] fetchCatalog jid=${jid} instance=${instanceName}`);
-
-    const page = await this.getPage(jid, instanceName);
-
-    try {
-      // Wait for WA Web to be ready
-      const ready = await page.evaluate(IS_WA_READY_IN_PAGE);
-      if (!ready.ready) {
-        const qrCode = await this.ensureQrCode(jid, instanceName, page);
-        return {
-          wuid: jid,
-          numberExists: true,
-          isBusiness: true,
-          catalogLength: 0,
-          catalog: [],
-          truncated: false,
-          nextCursor: null,
-          source: 'browser',
-          // Include QR code via cast — caller knows to check for it
-          ...(qrCode ? ({ qrCode } as any) : {}),
-        };
-      }
-
-      // Clear any pending QR (now authenticated)
-      this.pendingQr.delete(jid);
-
-      // Run the 4-layer fetch inside the browser
-      const result = await page.evaluate(FETCH_CATALOG_IN_PAGE);
-
-      if (result.message) {
-        this.logger.warn(`[browser] fetchCatalog message: ${result.message}`);
-      }
-
-      this.logger.log(`[browser] fetchCatalog got ${result.catalog.length} products`);
-
-      return {
-        wuid: jid,
-        numberExists: true,
-        isBusiness: true,
-        catalogLength: result.catalog.length,
-        catalog: result.catalog,
-        truncated: false,
-        nextCursor: null,
-        source: 'browser',
-      };
-    } finally {
-      await page.close().catch(() => {});
-      this.resetIdleTimer(jid);
-    }
+  private userDataDir(instanceName: string): string {
+    return join(INSTANCE_DIR, instanceName, SESSION_SUBDIR);
   }
 
   /**
-   * Public entry: fetch collections via browser.
+   * Clean stale Chromium lock files left by previous crashed sessions.
    */
-  async fetchCollections(options: BrowserCollectionsOptions): Promise<BrowserCollectionsResult> {
-    if (!this.config.enabled) {
-      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
-    }
-
-    const { jid, instanceName } = options;
-    this.logger.log(`[browser] fetchCollections jid=${jid} instance=${instanceName}`);
-
-    const page = await this.getPage(jid, instanceName);
-
-    try {
-      const ready = await page.evaluate(IS_WA_READY_IN_PAGE);
-      if (!ready.ready) {
-        const qrCode = await this.ensureQrCode(jid, instanceName, page);
-        return {
-          wuid: jid,
-          name: null,
-          numberExists: true,
-          isBusiness: true,
-          collectionsLength: 0,
-          collections: [],
-          source: 'browser',
-          ...(qrCode ? ({ qrCode } as any) : {}),
-        };
-      }
-
-      this.pendingQr.delete(jid);
-      const result = await page.evaluate(FETCH_COLLECTIONS_IN_PAGE);
-
-      if (result.message) {
-        this.logger.warn(`[browser] fetchCollections message: ${result.message}`);
-      }
-
-      this.logger.log(`[browser] fetchCollections got ${result.collections.length} collections`);
-
-      return {
-        wuid: jid,
-        name: null,
-        numberExists: true,
-        isBusiness: true,
-        collectionsLength: result.collections.length,
-        collections: result.collections,
-        source: 'browser',
-      };
-    } finally {
-      await page.close().catch(() => {});
-      this.resetIdleTimer(jid);
-    }
-  }
-
-  /**
-   * Logout: kill browser + delete session for an instance.
-   */
-  async logout(instanceName: string, jid: string): Promise<void> {
-    await this.killBrowser(jid);
-    this.sessionStore.deleteSession(instanceName);
-    this.pendingQr.delete(jid);
-    this.logger.log(`[browser] Logged out instance=${instanceName} jid=${jid}`);
-  }
-
-  /**
-   * Shutdown all browsers (for graceful app close).
-   */
-  async shutdownAll(): Promise<void> {
-    const jids = Array.from(this.browsers.keys());
-    await Promise.all(jids.map((j) => this.killBrowser(j)));
-    this.logger.log(`[browser] Shutdown ${jids.length} browser(s)`);
-  }
-
-  /**
-   * Get or launch a browser page for the given JID.
-   */
-  private async getPage(jid: string, instanceName: string): Promise<Page> {
-    let browser = this.browsers.get(jid);
-    if (!browser) {
-      browser = await this.launchBrowser(jid, instanceName);
-    }
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    );
-    return page;
-  }
-
-  /**
-   * Launch a new browser for the JID, navigating to WhatsApp Web and
-   * restoring session from disk if available.
-   */
-  private async launchBrowser(jid: string, instanceName: string): Promise<Browser> {
-    if (this.browsers.size >= this.config.maxSessions) {
-      // Evict oldest idle browser
-      const oldestJid = this.browsers.keys().next().value;
-      if (oldestJid) {
-        this.logger.warn(`[browser] Max sessions reached, evicting oldest: ${oldestJid}`);
-        await this.killBrowser(oldestJid);
-      }
-    }
-
-    const userDataDir = this.sessionStore.userDataDir(instanceName);
-    this.logger.log(`[browser] Launching Chromium for instance=${instanceName} jid=${jid}`);
-
-    // Clean up stale SingletonLock file from previous crashed launches.
-    // Chromium creates this lock file to prevent concurrent profile access,
-    // but if a previous process crashed, the lock stays and blocks new launches.
-    this.cleanStaleLocks(userDataDir);
-
-    const browser = await puppeteer.launch({
-      executablePath: this.config.executablePath,
-      headless: this.config.headless,
-      userDataDir,
-      args: this.config.extraArgs,
-      defaultViewport: { width: 1280, height: 800 },
-      ignoreDefaultArgs: ['--enable-automation'],
-      // Wait for initial page to be ready before returning
-      protocolTimeout: 60000,
-    });
-
-    this.browsers.set(jid, browser);
-
-    // Handle unexpected browser disconnect — clean up so next call can re-launch
-    browser.on('disconnected', () => {
-      this.logger.warn(`[browser] Browser disconnected for jid=${jid}, cleaning up`);
-      this.browsers.delete(jid);
-      const timer = this.idleTimers.get(jid);
-      if (timer) {
-        clearTimeout(timer);
-        this.idleTimers.delete(jid);
-      }
-      this.pendingQr.delete(jid);
-    });
-
-    // Navigate to WA Web on the first page
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    );
-    await page.goto('https://web.whatsapp.com/', {
-      waitUntil: 'networkidle2',
-      timeout: 90000,
-    });
-
-    // Inject @wppconnect/wa-js library — required to access window.WPP API
-    // (whatsapp-web.js bundles this, but since we use puppeteer-core directly,
-    // we need to inject it ourselves)
-    await this.injectWaJs(page);
-
-    return browser;
-  }
-
-  /**
-   * Inject @wppconnect/wa-js into the page and wait for WPP.isReady.
-   * This library provides the window.WPP API we use for catalog fetching.
-   */
-  private async injectWaJs(page: Page): Promise<void> {
-    const wppExists = await page.evaluate(() => typeof (window as any).WPP !== 'undefined');
-    if (wppExists) {
-      this.logger.log('[browser] WPP already loaded in page');
-      return;
-    }
-
-    this.logger.log('[browser] Injecting @wppconnect/wa-js into page...');
-
-    // Read wa-js from node_modules and inject via page.evaluate
-    try {
-      const waJsPath = require.resolve('@wppconnect/wa-js');
-      const fs = await import('fs');
-      const waJsCode = fs.readFileSync(waJsPath, 'utf8');
-      await page.evaluate(waJsCode);
-      this.logger.log(`[browser] wa-js injected (${waJsCode.length} chars)`);
-    } catch (err) {
-      this.logger.error(`[browser] Failed to inject wa-js: ${(err as Error).message}`);
-      throw new BadRequestException(
-        'Failed to inject @wppconnect/wa-js. Make sure it is installed: npm install @wppconnect/wa-js',
-      );
-    }
-
-    // Wait for WPP to be ready
-    try {
-      await page.waitForFunction(
-        () => (window as any).WPP && (window as any).WPP.isReady === true,
-        { timeout: 30000 },
-      );
-      this.logger.log('[browser] WPP.isReady = true');
-    } catch (err) {
-      this.logger.warn('[browser] WPP.isReady timeout — continuing anyway');
-    }
-
-    // Give WA Web + WPP a few more seconds to stabilize
-    await new Promise((r) => setTimeout(r, 5000));
-  }
-
-  /**
-   * Ensure a QR code is available for the user to scan.
-   * Returns the QR data URL if authentication is required.
-   */
-  private async ensureQrCode(jid: string, instanceName: string, page: Page): Promise<string | null> {
-    // Check if we already have a pending QR for this JID
-    const existing = this.pendingQr.get(jid);
-    if (existing) return existing;
-
-    // Try to extract QR from WA Web page
-    try {
-      // WA Web renders QR as a canvas — extract data URL
-      const qrDataUrl = await page.evaluate(async () => {
-        const wpp = (window as any).WPP;
-        if (wpp?.conn?.getQRCode) {
-          try {
-            return await wpp.conn.getQRCode();
-          } catch {
-            /* fall through */
-          }
-        }
-        // Fallback: scrape canvas
-        const canvas = document.querySelector('canvas[aria-label="QR code"], canvas');
-        if (canvas) {
-          return (canvas as HTMLCanvasElement).toDataURL('image/png');
-        }
-        return null;
-      });
-
-      if (qrDataUrl) {
-        this.pendingQr.set(jid, qrDataUrl);
-        return qrDataUrl;
-      }
-    } catch (err) {
-      this.logger.warn(`[browser] Failed to extract QR: ${(err as Error).message}`);
-    }
-
-    return null;
-  }
-
-  /**
-   * Reset the idle timer — call after each activity.
-   * When timer fires, the browser is killed to free memory.
-   */
-  private resetIdleTimer(jid: string): void {
-    const existing = this.idleTimers.get(jid);
-    if (existing) clearTimeout(existing);
-
-    const timer = setTimeout(() => {
-      this.logger.log(`[browser] Idle timeout for jid=${jid}, killing browser`);
-      this.killBrowser(jid).catch((err) => {
-        this.logger.error(`[browser] Failed to kill idle browser: ${(err as Error).message}`);
-      });
-    }, this.config.idleTimeoutMs);
-
-    this.idleTimers.set(jid, timer);
-  }
-
-  /**
-   * Remove stale Chromium lock files and kill orphan Chromium processes
-   * left over from previous crashed launches.
-   *
-   * Chromium creates SingletonLock, SingletonCookie, and SingletonSocket
-   * symlinks in the userDataDir. If a previous process crashed, these
-   * locks persist and block new launches with "profile appears to be in
-   * use by another Chromium process" error.
-   */
-  private cleanStaleLocks(userDataDir: string): void {
-    // 1. Remove lock files/symlinks
-    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
-    for (const lockFile of lockFiles) {
-      const lockPath = join(userDataDir, lockFile);
-      if (existsSync(lockPath)) {
+  private cleanStaleLocks(dir: string): void {
+    for (const lockFile of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      const p = join(dir, lockFile);
+      if (existsSync(p)) {
         try {
-          unlinkSync(lockPath);
+          unlinkSync(p);
           this.logger.log(`[browser] Removed stale lock: ${lockFile}`);
         } catch (err) {
           this.logger.warn(`[browser] Failed to remove ${lockFile}: ${(err as Error).message}`);
         }
       }
     }
+  }
 
-    // 2. Kill orphan chromium processes (best-effort, ignore errors)
-    // This handles the case where a previous Puppeteer crash left
-    // chromium processes running and holding the profile.
+  /**
+   * Get or create a Client for the given instance.
+   * Returns once the client is fully ready (authenticated + WA Web loaded).
+   */
+  private async getReadyClient(instanceName: string): Promise<InstanceClientState> {
+    let state = this.clients.get(instanceName);
+    if (state) {
+      // Reset idle timer
+      this.resetIdleTimer(instanceName);
+      await state.readyPromise;
+      return state;
+    }
+
+    // Evict oldest if at capacity
+    if (this.clients.size >= this.config.maxSessions) {
+      const oldest = Array.from(this.clients.entries()).sort(
+        (a, b) => a[1].lastActivity - b[1].lastActivity,
+      )[0];
+      if (oldest) {
+        this.logger.warn(`[browser] Max sessions reached, evicting: ${oldest[0]}`);
+        await this.killClient(oldest[0]);
+      }
+    }
+
+    state = this.launchClient(instanceName);
+    this.clients.set(instanceName, state);
+    this.resetIdleTimer(instanceName);
+    await state.readyPromise;
+    return state;
+  }
+
+  /**
+   * Launch a new whatsapp-web.js Client for the instance.
+   * Sets up event listeners for qr / authenticated / ready / disconnected.
+   */
+  private launchClient(instanceName: string): InstanceClientState {
+    const userDataDir = this.userDataDir(instanceName);
+    mkdirSync(userDataDir, { recursive: true });
+    this.cleanStaleLocks(userDataDir);
+
+    this.logger.log(`[browser] Launching Client for instance=${instanceName}`);
+
+    const state: InstanceClientState = {
+      client: null as any,
+      ready: false,
+      readyPromise: null as any,
+      qrCode: null,
+      pairingCode: null,
+      lastActivity: Date.now(),
+    };
+
+    const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: instanceName,
+        dataPath: userDataDir,
+      }),
+      puppeteer: {
+        executablePath: this.config.executablePath,
+        headless: this.config.headless,
+        args: this.config.extraArgs,
+        // @ts-expect-error - bypassCSP is supported by whatsapp-web.js puppeteer config but not in puppeteer types
+        bypassCSP: true,
+      },
+    });
+    state.client = client;
+
+    // Set up event listeners
+    client.on('qr', (qr: string) => {
+      this.logger.log(`[browser] QR received for instance=${instanceName}`);
+      state.qrCode = qr;
+      state.pairingCode = null;
+    });
+
+    client.on('authenticated', () => {
+      this.logger.log(`[browser] Authenticated for instance=${instanceName}`);
+      state.qrCode = null;
+      state.pairingCode = null;
+    });
+
+    client.on('ready', () => {
+      this.logger.log(`[browser] Client ready for instance=${instanceName}`);
+      state.ready = true;
+      state.qrCode = null;
+      state.pairingCode = null;
+    });
+
+    client.on('auth_failure', (msg: string) => {
+      this.logger.error(`[browser] Auth failure for instance=${instanceName}: ${msg}`);
+    });
+
+    client.on('disconnected', (reason: string) => {
+      this.logger.warn(`[browser] Disconnected for instance=${instanceName}: ${reason}`);
+      this.clients.delete(instanceName);
+    });
+
+    // Create readyPromise that resolves when 'ready' event fires
+    state.readyPromise = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Client initialization timed out after 120s for instance=${instanceName}`));
+      }, 120000);
+
+      client.once('ready', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      client.once('auth_failure', (msg: string) => {
+        clearTimeout(timeout);
+        reject(new Error(`Auth failure: ${msg}`));
+      });
+    });
+
+    // Initialize (async, but don't await — readyPromise will resolve when ready)
+    client.initialize().catch((err: Error) => {
+      this.logger.error(`[browser] Initialize failed for instance=${instanceName}: ${err.message}`);
+    });
+
+    return state;
+  }
+
+  /**
+   * Public entry: fetch catalog via browser.
+   * If session is not authenticated, returns qrCode in the result for the
+   * caller to surface to the user.
+   */
+  async fetchCatalog(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
+    if (!this.config.enabled) {
+      throw new BadRequestException(
+        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
+      );
+    }
+
+    const { instanceName } = options;
+    this.logger.log(`[browser] fetchCatalog instance=${instanceName}`);
+
+    let state: InstanceClientState;
     try {
-      execSync('pkill -f chromium 2>/dev/null || true', { timeout: 5000 });
-    } catch {
-      // pkill exit code 1 = no process matched, ignore
+      state = await this.getReadyClient(instanceName);
+    } catch (err) {
+      // If init failed (e.g. not authenticated within timeout),
+      // return current QR/pairing state if available
+      const currentState = this.clients.get(instanceName);
+      if (currentState?.qrCode) {
+        return this.buildAuthPendingResult(options.jid, currentState);
+      }
+      throw err;
+    }
+
+    if (!state.ready || state.qrCode) {
+      return this.buildAuthPendingResult(options.jid, state);
+    }
+
+    // Client is ready — fetch catalog via window.WPP API
+    const page = await state.client.pupPage;
+    if (!page) {
+      throw new BadRequestException('WhatsApp Web page not available');
+    }
+
+    const result = await page.evaluate(async (): Promise<{
+      catalog: BrowserProduct[];
+      message?: string;
+    }> => {
+      const wpp = (window as any).WPP;
+      if (!wpp) return { catalog: [], message: 'WPP not available' };
+
+      const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
+      const userId = (myUser && myUser._serialized) || '';
+      if (!userId) return { catalog: [], message: 'User ID not found' };
+
+      const whatsappApi = wpp.whatsapp;
+      const productsById = new Map<string, BrowserProduct>();
+
+      const addProduct = (rawProduct: any) => {
+        const product = rawProduct?.attributes || rawProduct;
+        if (!product?.id) return;
+        if (!productsById.has(product.id)) {
+          productsById.set(product.id, product as BrowserProduct);
+        }
+      };
+
+      const extractProductsFromCatalog = (catalogEntry: any): any[] => {
+        if (!catalogEntry) return [];
+        const productIndex = catalogEntry.productCollection?._index;
+        if (!productIndex || typeof productIndex !== 'object') return [];
+        return Object.keys(productIndex)
+          .map((productId) => productIndex[productId]?.attributes)
+          .filter(Boolean);
+      };
+
+      // Layer 1: queryCatalog with pagination cursor
+      if (whatsappApi?.functions?.queryCatalog) {
+        try {
+          let afterToken: string | undefined = undefined;
+          let safetyCount = 0;
+          while (safetyCount < 500) {
+            const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
+            const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
+            for (const product of pageProducts) {
+              addProduct(product);
+            }
+            const nextAfter = response?.paging?.cursors?.after;
+            if (!nextAfter || nextAfter === afterToken) break;
+            afterToken = nextAfter;
+            safetyCount++;
+          }
+        } catch (error: any) {
+          console.log('queryCatalog unavailable:', error?.message);
+        }
+      }
+
+      // Layer 2: CatalogStore.findQuery
+      if (whatsappApi?.CatalogStore?.findQuery) {
+        try {
+          const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
+          if (Array.isArray(results)) {
+            for (const entry of results) {
+              const products = extractProductsFromCatalog(entry);
+              for (const product of products) {
+                addProduct(product);
+              }
+            }
+          }
+        } catch (error: any) {
+          console.log('CatalogStore.findQuery unavailable:', error?.message);
+        }
+      }
+
+      // Layer 3: WPP.catalog.getMyCatalog
+      try {
+        const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
+        const fallbackProducts = extractProductsFromCatalog(myCatalog);
+        for (const product of fallbackProducts) {
+          addProduct(product);
+        }
+      } catch (error: any) {
+        console.log('getMyCatalog unavailable:', error?.message);
+      }
+
+      // Layer 4: WPP.catalog.getProducts (last resort)
+      if (productsById.size === 0) {
+        try {
+          const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
+          if (Array.isArray(fallbackProducts)) {
+            for (const product of fallbackProducts) {
+              addProduct(product);
+            }
+          }
+        } catch (error: any) {
+          console.log('getProducts unavailable:', error?.message);
+        }
+      }
+
+      return { catalog: Array.from(productsById.values()) };
+    });
+
+    this.logger.log(`[browser] fetchCatalog got ${result.catalog.length} products`);
+
+    return {
+      wuid: options.jid,
+      numberExists: true,
+      isBusiness: true,
+      catalogLength: result.catalog.length,
+      catalog: result.catalog,
+      truncated: false,
+      nextCursor: null,
+      source: 'browser',
+    };
+  }
+
+  /**
+   * Public entry: fetch collections via browser.
+   */
+  async fetchCollections(
+    options: BrowserCollectionsOptions,
+  ): Promise<BrowserCollectionsResult> {
+    if (!this.config.enabled) {
+      throw new BadRequestException(
+        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
+      );
+    }
+
+    const { instanceName } = options;
+    this.logger.log(`[browser] fetchCollections instance=${instanceName}`);
+
+    let state: InstanceClientState;
+    try {
+      state = await this.getReadyClient(instanceName);
+    } catch (err) {
+      const currentState = this.clients.get(instanceName);
+      if (currentState?.qrCode) {
+        return this.buildAuthPendingCollectionsResult(options.jid, currentState);
+      }
+      throw err;
+    }
+
+    if (!state.ready || state.qrCode) {
+      return this.buildAuthPendingCollectionsResult(options.jid, state);
+    }
+
+    const page = await state.client.pupPage;
+    if (!page) {
+      throw new BadRequestException('WhatsApp Web page not available');
+    }
+
+    const result = await page.evaluate(async (): Promise<{
+      collections: BrowserCollection[];
+      message?: string;
+    }> => {
+      const wpp = (window as any).WPP;
+      if (!wpp) return { collections: [], message: 'WPP not available' };
+
+      const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
+      const userId = (myUser && myUser._serialized) || '';
+      if (!userId) return { collections: [], message: 'User ID not found' };
+
+      const whatsappApi = wpp.whatsapp;
+      const collections: BrowserCollection[] = [];
+
+      // Method 1: WPP.catalog.getCollections
+      try {
+        const response: any = await wpp.catalog?.getCollections?.(userId);
+        if (Array.isArray(response)) {
+          for (const c of response) {
+            const attrs = c?.attributes || c;
+            if (!attrs?.id) continue;
+            const productIndex = c?.productCollection?._index || attrs?.products?._index;
+            const products: BrowserProduct[] = [];
+            if (productIndex && typeof productIndex === 'object') {
+              for (const pid of Object.keys(productIndex)) {
+                const p = productIndex[pid]?.attributes || productIndex[pid];
+                if (p) products.push(p as BrowserProduct);
+              }
+            }
+            collections.push({
+              id: attrs.id,
+              name: attrs.name || '',
+              products,
+              status: attrs.status,
+            });
+          }
+        }
+      } catch (error: any) {
+        console.log('WPP.catalog.getCollections failed:', error?.message);
+      }
+
+      // Method 2: CollectionStore.findQuery fallback
+      if (collections.length === 0 && whatsappApi?.CollectionStore?.findQuery) {
+        try {
+          const results: any[] = await whatsappApi.CollectionStore.findQuery(userId);
+          if (Array.isArray(results)) {
+            for (const c of results) {
+              const attrs = c?.attributes || c;
+              if (!attrs?.id) continue;
+              const productIndex = c?.productCollection?._index;
+              const products: BrowserProduct[] = [];
+              if (productIndex && typeof productIndex === 'object') {
+                for (const pid of Object.keys(productIndex)) {
+                  const p = productIndex[pid]?.attributes || productIndex[pid];
+                  if (p) products.push(p as BrowserProduct);
+                }
+              }
+              collections.push({
+                id: attrs.id,
+                name: attrs.name || '',
+                products,
+                status: attrs.status,
+              });
+            }
+          }
+        } catch (error: any) {
+          console.log('CollectionStore.findQuery failed:', error?.message);
+        }
+      }
+
+      return { collections };
+    });
+
+    this.logger.log(`[browser] fetchCollections got ${result.collections.length} collections`);
+
+    return {
+      wuid: options.jid,
+      name: null,
+      numberExists: true,
+      isBusiness: true,
+      collectionsLength: result.collections.length,
+      collections: result.collections,
+      source: 'browser',
+    };
+  }
+
+  /**
+   * Request a phone-number pairing code for an instance.
+   * Returns the 8-character code (e.g. "ABCD1234") that the user enters
+   * on their phone in WhatsApp → Linked Devices → Link with phone number instead.
+   *
+   * Phone format: international, digits only (e.g. "6285733556953" for Indonesia).
+   */
+  async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {
+    if (!this.config.enabled) {
+      throw new BadRequestException(
+        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
+      );
+    }
+
+    const state = await this.getReadyClient(instanceName);
+    // requestPairingCode works even before 'ready' event (it's needed for auth)
+    // whatsapp-web.js will trigger 'code_received' event with the code
+    const code = await state.client.requestPairingCode(phoneNumber);
+    state.pairingCode = code;
+    this.logger.log(`[browser] Pairing code requested for instance=${instanceName} phone=${phoneNumber}: ${code}`);
+    return code;
+  }
+
+  /**
+   * Get current auth state for an instance (qrCode, pairingCode, ready).
+   */
+  getAuthState(instanceName: string): {
+    ready: boolean;
+    qrCode: string | null;
+    pairingCode: string | null;
+  } {
+    const state = this.clients.get(instanceName);
+    if (!state) {
+      return { ready: false, qrCode: null, pairingCode: null };
+    }
+    return {
+      ready: state.ready,
+      qrCode: state.qrCode,
+      pairingCode: state.pairingCode,
+    };
+  }
+
+  /**
+   * Logout: kill client + delete session for an instance.
+   */
+  async logout(instanceName: string): Promise<void> {
+    await this.killClient(instanceName);
+    const userDataDir = this.userDataDir(instanceName);
+    if (existsSync(userDataDir)) {
+      rmSync(userDataDir, { recursive: true, force: true });
+      this.logger.log(`[browser] Deleted session for instance=${instanceName}`);
     }
   }
 
   /**
-   * Kill the browser for a JID and clean up timers.
+   * Shutdown all clients (for graceful app close).
    */
-  private async killBrowser(jid: string): Promise<void> {
-    const timer = this.idleTimers.get(jid);
-    if (timer) {
-      clearTimeout(timer);
-      this.idleTimers.delete(jid);
+  async shutdownAll(): Promise<void> {
+    const names = Array.from(this.clients.keys());
+    await Promise.all(names.map((n) => this.killClient(n)));
+    this.logger.log(`[browser] Shutdown ${names.length} client(s)`);
+  }
+
+  private buildAuthPendingResult(jid: string, state: InstanceClientState): BrowserCatalogResult {
+    const result: any = {
+      wuid: jid,
+      numberExists: true,
+      isBusiness: true,
+      catalogLength: 0,
+      catalog: [],
+      truncated: false,
+      nextCursor: null,
+      source: 'browser',
+      status: 'auth_required',
+    };
+    if (state.qrCode) result.qrCode = state.qrCode;
+    if (state.pairingCode) result.pairingCode = state.pairingCode;
+    return result;
+  }
+
+  private buildAuthPendingCollectionsResult(
+    jid: string,
+    state: InstanceClientState,
+  ): BrowserCollectionsResult {
+    const result: any = {
+      wuid: jid,
+      name: null,
+      numberExists: true,
+      isBusiness: true,
+      collectionsLength: 0,
+      collections: [],
+      source: 'browser',
+      status: 'auth_required',
+    };
+    if (state.qrCode) result.qrCode = state.qrCode;
+    if (state.pairingCode) result.pairingCode = state.pairingCode;
+    return result;
+  }
+
+  /**
+   * Reset the idle timer for an instance. When timer fires, the client
+   * is killed to free memory.
+   */
+  private resetIdleTimer(instanceName: string): void {
+    const state = this.clients.get(instanceName);
+    if (!state) return;
+
+    if (state.idleTimer) clearTimeout(state.idleTimer);
+
+    state.idleTimer = setTimeout(() => {
+      this.logger.log(`[browser] Idle timeout for instance=${instanceName}, killing client`);
+      this.killClient(instanceName).catch((err) => {
+        this.logger.error(`[browser] Failed to kill idle client: ${(err as Error).message}`);
+      });
+    }, this.config.idleTimeoutMs);
+  }
+
+  /**
+   * Kill the client for an instance and clean up timers.
+   */
+  private async killClient(instanceName: string): Promise<void> {
+    const state = this.clients.get(instanceName);
+    if (!state) return;
+
+    if (state.idleTimer) {
+      clearTimeout(state.idleTimer);
     }
-    const browser = this.browsers.get(jid);
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (err) {
-        this.logger.warn(`[browser] Error closing browser: ${(err as Error).message}`);
-      }
-      this.browsers.delete(jid);
+
+    try {
+      await state.client.destroy();
+    } catch (err) {
+      this.logger.warn(`[browser] Error closing client: ${(err as Error).message}`);
     }
-    this.pendingQr.delete(jid);
+
+    this.clients.delete(instanceName);
   }
 }
