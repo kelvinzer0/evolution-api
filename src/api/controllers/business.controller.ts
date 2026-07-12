@@ -1,7 +1,7 @@
 import { getCatalogDto, getCollectionsDto } from '@api/dto/business.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
-import { WAMonitoringService } from '@api/services/monitor.service';
 import { BrowserCatalogService } from '@api/integrations/channel/whatsapp/catalog-browser.service';
+import { WAMonitoringService } from '@api/services/monitor.service';
 
 export class BusinessController {
   constructor(private readonly waMonitor: WAMonitoringService) {}

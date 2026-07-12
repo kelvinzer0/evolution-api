@@ -1,9 +1,5 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
-import {
-  getCatalogDto,
-  getCollectionsDto,
-  requestPairingCodeDto,
-} from '@api/dto/business.dto';
+import { getCatalogDto, getCollectionsDto, requestPairingCodeDto } from '@api/dto/business.dto';
 import { businessController } from '@api/server.module';
 import { createMetaErrorResponse } from '@utils/errorResponse';
 import { catalogSchema, collectionsSchema, pairingCodeSchema } from '@validate/validate.schema';

@@ -20,12 +20,11 @@
  *   bedones-whatsapp/apps/whatsapp-connector/src/catalog/catalog.service.ts
  */
 
-import { existsSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
-
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException } from '@exceptions';
+import { existsSync, mkdirSync, rmSync, unlinkSync } from 'fs';
+import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
 import {
@@ -82,9 +81,7 @@ export class BrowserCatalogService {
     BrowserCatalogService.setInstance(this);
   }
 
-  static async fetchCatalogOrThrow(
-    options: BrowserCatalogOptions,
-  ): Promise<BrowserCatalogResult> {
+  static async fetchCatalogOrThrow(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
       throw new BadRequestException(
@@ -94,9 +91,7 @@ export class BrowserCatalogService {
     return svc.fetchCatalog(options);
   }
 
-  static async fetchCollectionsOrThrow(
-    options: BrowserCollectionsOptions,
-  ): Promise<BrowserCollectionsResult> {
+  static async fetchCollectionsOrThrow(options: BrowserCollectionsOptions): Promise<BrowserCollectionsResult> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
       throw new BadRequestException(
@@ -111,12 +106,9 @@ export class BrowserCatalogService {
     const idleTimeoutMs = parseInt(process.env.CATALOG_BROWSER_IDLE_TIMEOUT_MS || '600000', 10);
     const maxSessions = parseInt(process.env.CATALOG_BROWSER_MAX_SESSIONS || '5', 10);
     const headlessEnv = (process.env.CATALOG_BROWSER_HEADLESS || 'true').toLowerCase();
-    const headless: boolean | 'shell' =
-      headlessEnv === 'shell' ? 'shell' : headlessEnv === 'false' ? false : true;
+    const headless: boolean | 'shell' = headlessEnv === 'shell' ? 'shell' : headlessEnv === 'false' ? false : true;
     const executablePath =
-      process.env.PUPPETEER_EXECUTABLE_PATH ||
-      process.env.CHROMIUM_PATH ||
-      '/usr/bin/chromium-browser';
+      process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
 
     return {
       enabled,
@@ -185,9 +177,7 @@ export class BrowserCatalogService {
 
     // Evict oldest if at capacity
     if (this.clients.size >= this.config.maxSessions) {
-      const oldest = Array.from(this.clients.entries()).sort(
-        (a, b) => a[1].lastActivity - b[1].lastActivity,
-      )[0];
+      const oldest = Array.from(this.clients.entries()).sort((a, b) => a[1].lastActivity - b[1].lastActivity)[0];
       if (oldest) {
         this.logger.warn(`[browser] Max sessions reached, evicting: ${oldest[0]}`);
         await this.killClient(oldest[0]);
@@ -305,9 +295,7 @@ export class BrowserCatalogService {
    */
   async fetchCatalog(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
     if (!this.config.enabled) {
-      throw new BadRequestException(
-        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
-      );
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
     }
 
     const { instanceName } = options;
@@ -336,102 +324,104 @@ export class BrowserCatalogService {
       throw new BadRequestException('WhatsApp Web page not available');
     }
 
-    const result = await page.evaluate(async (): Promise<{
-      catalog: BrowserProduct[];
-      message?: string;
-    }> => {
-      const wpp = (window as any).WPP;
-      if (!wpp) return { catalog: [], message: 'WPP not available' };
+    const result = await page.evaluate(
+      async (): Promise<{
+        catalog: BrowserProduct[];
+        message?: string;
+      }> => {
+        const wpp = (window as any).WPP;
+        if (!wpp) return { catalog: [], message: 'WPP not available' };
 
-      const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-      const userId = (myUser && myUser._serialized) || '';
-      if (!userId) return { catalog: [], message: 'User ID not found' };
+        const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
+        const userId = (myUser && myUser._serialized) || '';
+        if (!userId) return { catalog: [], message: 'User ID not found' };
 
-      const whatsappApi = wpp.whatsapp;
-      const productsById = new Map<string, BrowserProduct>();
+        const whatsappApi = wpp.whatsapp;
+        const productsById = new Map<string, BrowserProduct>();
 
-      const addProduct = (rawProduct: any) => {
-        const product = rawProduct?.attributes || rawProduct;
-        if (!product?.id) return;
-        if (!productsById.has(product.id)) {
-          productsById.set(product.id, product as BrowserProduct);
-        }
-      };
+        const addProduct = (rawProduct: any) => {
+          const product = rawProduct?.attributes || rawProduct;
+          if (!product?.id) return;
+          if (!productsById.has(product.id)) {
+            productsById.set(product.id, product as BrowserProduct);
+          }
+        };
 
-      const extractProductsFromCatalog = (catalogEntry: any): any[] => {
-        if (!catalogEntry) return [];
-        const productIndex = catalogEntry.productCollection?._index;
-        if (!productIndex || typeof productIndex !== 'object') return [];
-        return Object.keys(productIndex)
-          .map((productId) => productIndex[productId]?.attributes)
-          .filter(Boolean);
-      };
+        const extractProductsFromCatalog = (catalogEntry: any): any[] => {
+          if (!catalogEntry) return [];
+          const productIndex = catalogEntry.productCollection?._index;
+          if (!productIndex || typeof productIndex !== 'object') return [];
+          return Object.keys(productIndex)
+            .map((productId) => productIndex[productId]?.attributes)
+            .filter(Boolean);
+        };
 
-      // Layer 1: queryCatalog with pagination cursor
-      if (whatsappApi?.functions?.queryCatalog) {
-        try {
-          let afterToken: string | undefined = undefined;
-          let safetyCount = 0;
-          while (safetyCount < 500) {
-            const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
-            const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
-            for (const product of pageProducts) {
-              addProduct(product);
+        // Layer 1: queryCatalog with pagination cursor
+        if (whatsappApi?.functions?.queryCatalog) {
+          try {
+            let afterToken: string | undefined = undefined;
+            let safetyCount = 0;
+            while (safetyCount < 500) {
+              const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
+              const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
+              for (const product of pageProducts) {
+                addProduct(product);
+              }
+              const nextAfter = response?.paging?.cursors?.after;
+              if (!nextAfter || nextAfter === afterToken) break;
+              afterToken = nextAfter;
+              safetyCount++;
             }
-            const nextAfter = response?.paging?.cursors?.after;
-            if (!nextAfter || nextAfter === afterToken) break;
-            afterToken = nextAfter;
-            safetyCount++;
+          } catch (error: any) {
+            console.log('queryCatalog unavailable:', error?.message);
+          }
+        }
+
+        // Layer 2: CatalogStore.findQuery
+        if (whatsappApi?.CatalogStore?.findQuery) {
+          try {
+            const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
+            if (Array.isArray(results)) {
+              for (const entry of results) {
+                const products = extractProductsFromCatalog(entry);
+                for (const product of products) {
+                  addProduct(product);
+                }
+              }
+            }
+          } catch (error: any) {
+            console.log('CatalogStore.findQuery unavailable:', error?.message);
+          }
+        }
+
+        // Layer 3: WPP.catalog.getMyCatalog
+        try {
+          const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
+          const fallbackProducts = extractProductsFromCatalog(myCatalog);
+          for (const product of fallbackProducts) {
+            addProduct(product);
           }
         } catch (error: any) {
-          console.log('queryCatalog unavailable:', error?.message);
+          console.log('getMyCatalog unavailable:', error?.message);
         }
-      }
 
-      // Layer 2: CatalogStore.findQuery
-      if (whatsappApi?.CatalogStore?.findQuery) {
-        try {
-          const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
-          if (Array.isArray(results)) {
-            for (const entry of results) {
-              const products = extractProductsFromCatalog(entry);
-              for (const product of products) {
+        // Layer 4: WPP.catalog.getProducts (last resort)
+        if (productsById.size === 0) {
+          try {
+            const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
+            if (Array.isArray(fallbackProducts)) {
+              for (const product of fallbackProducts) {
                 addProduct(product);
               }
             }
+          } catch (error: any) {
+            console.log('getProducts unavailable:', error?.message);
           }
-        } catch (error: any) {
-          console.log('CatalogStore.findQuery unavailable:', error?.message);
         }
-      }
 
-      // Layer 3: WPP.catalog.getMyCatalog
-      try {
-        const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
-        const fallbackProducts = extractProductsFromCatalog(myCatalog);
-        for (const product of fallbackProducts) {
-          addProduct(product);
-        }
-      } catch (error: any) {
-        console.log('getMyCatalog unavailable:', error?.message);
-      }
-
-      // Layer 4: WPP.catalog.getProducts (last resort)
-      if (productsById.size === 0) {
-        try {
-          const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
-          if (Array.isArray(fallbackProducts)) {
-            for (const product of fallbackProducts) {
-              addProduct(product);
-            }
-          }
-        } catch (error: any) {
-          console.log('getProducts unavailable:', error?.message);
-        }
-      }
-
-      return { catalog: Array.from(productsById.values()) };
-    });
+        return { catalog: Array.from(productsById.values()) };
+      },
+    );
 
     this.logger.log(`[browser] fetchCatalog got ${result.catalog.length} products`);
 
@@ -450,13 +440,9 @@ export class BrowserCatalogService {
   /**
    * Public entry: fetch collections via browser.
    */
-  async fetchCollections(
-    options: BrowserCollectionsOptions,
-  ): Promise<BrowserCollectionsResult> {
+  async fetchCollections(options: BrowserCollectionsOptions): Promise<BrowserCollectionsResult> {
     if (!this.config.enabled) {
-      throw new BadRequestException(
-        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
-      );
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
     }
 
     const { instanceName } = options;
@@ -482,56 +468,29 @@ export class BrowserCatalogService {
       throw new BadRequestException('WhatsApp Web page not available');
     }
 
-    const result = await page.evaluate(async (): Promise<{
-      collections: BrowserCollection[];
-      message?: string;
-    }> => {
-      const wpp = (window as any).WPP;
-      if (!wpp) return { collections: [], message: 'WPP not available' };
+    const result = await page.evaluate(
+      async (): Promise<{
+        collections: BrowserCollection[];
+        message?: string;
+      }> => {
+        const wpp = (window as any).WPP;
+        if (!wpp) return { collections: [], message: 'WPP not available' };
 
-      const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-      const userId = (myUser && myUser._serialized) || '';
-      if (!userId) return { collections: [], message: 'User ID not found' };
+        const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
+        const userId = (myUser && myUser._serialized) || '';
+        if (!userId) return { collections: [], message: 'User ID not found' };
 
-      const whatsappApi = wpp.whatsapp;
-      const collections: BrowserCollection[] = [];
+        const whatsappApi = wpp.whatsapp;
+        const collections: BrowserCollection[] = [];
 
-      // Method 1: WPP.catalog.getCollections
-      try {
-        const response: any = await wpp.catalog?.getCollections?.(userId);
-        if (Array.isArray(response)) {
-          for (const c of response) {
-            const attrs = c?.attributes || c;
-            if (!attrs?.id) continue;
-            const productIndex = c?.productCollection?._index || attrs?.products?._index;
-            const products: BrowserProduct[] = [];
-            if (productIndex && typeof productIndex === 'object') {
-              for (const pid of Object.keys(productIndex)) {
-                const p = productIndex[pid]?.attributes || productIndex[pid];
-                if (p) products.push(p as BrowserProduct);
-              }
-            }
-            collections.push({
-              id: attrs.id,
-              name: attrs.name || '',
-              products,
-              status: attrs.status,
-            });
-          }
-        }
-      } catch (error: any) {
-        console.log('WPP.catalog.getCollections failed:', error?.message);
-      }
-
-      // Method 2: CollectionStore.findQuery fallback
-      if (collections.length === 0 && whatsappApi?.CollectionStore?.findQuery) {
+        // Method 1: WPP.catalog.getCollections
         try {
-          const results: any[] = await whatsappApi.CollectionStore.findQuery(userId);
-          if (Array.isArray(results)) {
-            for (const c of results) {
+          const response: any = await wpp.catalog?.getCollections?.(userId);
+          if (Array.isArray(response)) {
+            for (const c of response) {
               const attrs = c?.attributes || c;
               if (!attrs?.id) continue;
-              const productIndex = c?.productCollection?._index;
+              const productIndex = c?.productCollection?._index || attrs?.products?._index;
               const products: BrowserProduct[] = [];
               if (productIndex && typeof productIndex === 'object') {
                 for (const pid of Object.keys(productIndex)) {
@@ -548,12 +507,41 @@ export class BrowserCatalogService {
             }
           }
         } catch (error: any) {
-          console.log('CollectionStore.findQuery failed:', error?.message);
+          console.log('WPP.catalog.getCollections failed:', error?.message);
         }
-      }
 
-      return { collections };
-    });
+        // Method 2: CollectionStore.findQuery fallback
+        if (collections.length === 0 && whatsappApi?.CollectionStore?.findQuery) {
+          try {
+            const results: any[] = await whatsappApi.CollectionStore.findQuery(userId);
+            if (Array.isArray(results)) {
+              for (const c of results) {
+                const attrs = c?.attributes || c;
+                if (!attrs?.id) continue;
+                const productIndex = c?.productCollection?._index;
+                const products: BrowserProduct[] = [];
+                if (productIndex && typeof productIndex === 'object') {
+                  for (const pid of Object.keys(productIndex)) {
+                    const p = productIndex[pid]?.attributes || productIndex[pid];
+                    if (p) products.push(p as BrowserProduct);
+                  }
+                }
+                collections.push({
+                  id: attrs.id,
+                  name: attrs.name || '',
+                  products,
+                  status: attrs.status,
+                });
+              }
+            }
+          } catch (error: any) {
+            console.log('CollectionStore.findQuery failed:', error?.message);
+          }
+        }
+
+        return { collections };
+      },
+    );
 
     this.logger.log(`[browser] fetchCollections got ${result.collections.length} collections`);
 
@@ -577,9 +565,7 @@ export class BrowserCatalogService {
    */
   async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {
     if (!this.config.enabled) {
-      throw new BadRequestException(
-        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
-      );
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
     }
 
     const state = await this.getReadyClient(instanceName);
@@ -648,10 +634,7 @@ export class BrowserCatalogService {
     return result;
   }
 
-  private buildAuthPendingCollectionsResult(
-    jid: string,
-    state: InstanceClientState,
-  ): BrowserCollectionsResult {
+  private buildAuthPendingCollectionsResult(jid: string, state: InstanceClientState): BrowserCollectionsResult {
     const result: any = {
       wuid: jid,
       name: null,
