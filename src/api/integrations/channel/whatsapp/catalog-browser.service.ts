@@ -482,6 +482,19 @@ export class BrowserCatalogService {
       // All products are serialized immediately via JSON.stringify to avoid
       // Puppeteer serialization crashes with non-serializable prototypes.
 
+      // Catalog fetch with pagination:
+      //
+      // WhatsApp Web uses lazy-loading (cache). CatalogStore only has the first
+      // page (~20 products). To get ALL products, must call findNextProductPage()
+      // in a loop — like scrolling down in the UI. Each call fetches the next
+      // batch from the server and appends to the store.
+      //
+      // Flow:
+      // 1. CatalogStore.findQuery(uid) → get catalog model + first page
+      // 2. Loop: CatalogStore.findNextProductPage(catalog.id) → load next page
+      // 3. Extract all products from catalog.productCollection._index
+      // 4. Repeat until findNextProductPage returns 0 new products
+
       const serializeProduct = (p: any): any | null => {
         if (!p?.id) return null;
         try {
@@ -491,18 +504,53 @@ export class BrowserCatalogService {
         }
       };
 
-      // Method 1: CatalogStore.findQuery — most reliable, returns ALL products
+      // Step 1: Get catalog model from CatalogStore
       if (whatsappApi?.CatalogStore?.findQuery) {
         try {
           const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
-          if (Array.isArray(results)) {
-            for (const entry of results) {
-              const products = extractProductsFromCatalog(entry);
+          if (Array.isArray(results) && results.length > 0) {
+            const catalogModel = results[0];
+
+            // Extract initial products
+            const extractAndAdd = () => {
+              const products = extractProductsFromCatalog(catalogModel);
               for (const product of products) {
                 const plain = serializeProduct(product);
                 if (plain && !productsById.has(plain.id)) {
                   productsById.set(plain.id, plain);
                 }
+              }
+            };
+            extractAndAdd();
+
+            // Step 2: Paginate — call findNextProductPage in a loop
+            if (whatsappApi.CatalogStore.findNextProductPage) {
+              let pageCount = 0;
+              const maxPages = 100; // Safety limit
+              while (pageCount < maxPages) {
+                const beforeCount = productsById.size;
+                try {
+                  // findNextProductPage(catalogWid) fetches next batch from server
+                  // and appends to catalogModel.productCollection._index
+                  await whatsappApi.CatalogStore.findNextProductPage(catalogModel.id);
+                } catch (e: any) {
+                  console.log(`findNextProductPage error (page ${pageCount}):`, e?.message);
+                  break;
+                }
+                // Re-extract products after loading more
+                extractAndAdd();
+                const afterCount = productsById.size;
+                pageCount++;
+
+                console.log(`Page ${pageCount}: ${afterCount - beforeCount} new products (total: ${afterCount})`);
+
+                // If no new products, we've reached the end
+                if (afterCount === beforeCount) {
+                  break;
+                }
+
+                // Small delay between pages (mimic scroll behavior)
+                await new Promise((r) => setTimeout(r, 500));
               }
             }
           }
@@ -511,7 +559,7 @@ export class BrowserCatalogService {
         }
       }
 
-      // Method 2: WPP.catalog.getMyCatalog — fallback
+      // Fallback: WPP.catalog.getMyCatalog
       if (productsById.size === 0) {
         try {
           const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
@@ -527,12 +575,10 @@ export class BrowserCatalogService {
         }
       }
 
-      // Method 3: WPP.catalog.getProducts — count=20 is optimal (count=999
-      // returns only 10 due to WhatsApp quirk). Try multiple counts to
-      // catch any products not in the store.
-      for (const count of [20, 10]) {
+      // Fallback: WPP.catalog.getProducts (max 20 per call)
+      if (productsById.size === 0) {
         try {
-          const products: any[] = await wpp.catalog?.getProducts?.(userId, count);
+          const products: any[] = await wpp.catalog?.getProducts?.(userId, 20);
           if (Array.isArray(products)) {
             for (const product of products) {
               const plain = serializeProduct(product);
@@ -542,7 +588,7 @@ export class BrowserCatalogService {
             }
           }
         } catch (error: any) {
-          console.log(`getProducts(uid, ${count}) error:`, error?.message);
+          console.log('getProducts error:', error?.message);
         }
       }
 
