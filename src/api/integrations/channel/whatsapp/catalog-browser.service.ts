@@ -460,14 +460,6 @@ export class BrowserCatalogService {
       const whatsappApi = wpp.whatsapp;
       const productsById = new Map<string, any>();
 
-      const addProduct = (rawProduct: any) => {
-        const product = rawProduct?.attributes || rawProduct;
-        if (!product?.id) return;
-        if (!productsById.has(product.id)) {
-          productsById.set(product.id, product);
-        }
-      };
-
       const extractProductsFromCatalog = (catalogEntry: any): any[] => {
         if (!catalogEntry) return [];
         const productIndex = catalogEntry.productCollection?._index;
