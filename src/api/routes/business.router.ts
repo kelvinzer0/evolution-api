@@ -1,5 +1,6 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { getCatalogDto, getCollectionsDto, requestPairingCodeDto } from '@api/dto/business.dto';
+import { InstanceDto } from '@api/dto/instance.dto';
 import { businessController } from '@api/server.module';
 import { createMetaErrorResponse } from '@utils/errorResponse';
 import { catalogSchema, collectionsSchema, pairingCodeSchema } from '@validate/validate.schema';
@@ -231,10 +232,10 @@ export class BusinessRouter extends RouterBroker {
        */
       .get(this.routerPath('getAuthState'), ...guards, async (req, res) => {
         try {
-          const response = await this.dataValidate<any>({
+          const response = await this.dataValidate<InstanceDto>({
             request: req,
             schema: null,
-            ClassRef: null,
+            ClassRef: InstanceDto,
             execute: (instance) => businessController.getAuthState(instance),
           });
 
@@ -267,10 +268,10 @@ export class BusinessRouter extends RouterBroker {
        */
       .delete(this.routerPath('logoutBrowser'), ...guards, async (req, res) => {
         try {
-          const response = await this.dataValidate<any>({
+          const response = await this.dataValidate<InstanceDto>({
             request: req,
             schema: null,
-            ClassRef: null,
+            ClassRef: InstanceDto,
             execute: (instance) => businessController.logoutBrowser(instance),
           });
 
