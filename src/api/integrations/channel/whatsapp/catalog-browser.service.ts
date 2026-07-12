@@ -548,7 +548,30 @@ export class BrowserCatalogService {
           }
         }
 
-        return { catalog: Array.from(productsById.values()) };
+        // Serialize products to plain objects before returning.
+        // WhatsApp product models contain non-serializable properties (methods,
+        // circular references) that cause Puppeteer's page.evaluate to return
+        // undefined. We must extract only serializable fields.
+        const catalog = Array.from(productsById.values()).map((p: any) => ({
+          id: p.id || '',
+          retailer_id: p.retailer_id || p.retailerId || '',
+          name: p.name || '',
+          description: p.description || '',
+          url: p.url || '',
+          currency: p.currency || '',
+          price: p.price != null ? String(p.price) : '',
+          is_hidden: p.is_hidden || false,
+          is_sanctioned: p.is_sanctioned || false,
+          max_available: p.max_available != null ? String(p.max_available) : '',
+          imageCdnUrl: p.imageCdnUrl || p.image_cdn_url || '',
+          additionalImageCdnUrl: Array.isArray(p.additionalImageCdnUrl)
+            ? p.additionalImageCdnUrl
+            : Array.isArray(p.additional_image_cdn_urls)
+              ? p.additional_image_cdn_urls
+              : [],
+        }));
+
+        return { catalog };
       },
       wppUserId,
     );
