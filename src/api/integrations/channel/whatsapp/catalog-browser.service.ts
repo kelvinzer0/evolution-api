@@ -553,6 +553,15 @@ export class BrowserCatalogService {
       wppUserId,
     );
 
+    // Null check — page.evaluate can return undefined if the page closes
+    // or the evaluation times out
+    if (!result || !result.catalog) {
+      this.logger.warn(`[browser] fetchCatalog: page.evaluate returned no result`);
+      throw new BadRequestException(
+        'Catalog fetch failed: WhatsApp Web page returned no data. ' + 'Try again in a few seconds.',
+      );
+    }
+
     this.logger.log(`[browser] fetchCatalog got ${result.catalog.length} products`);
 
     return {
