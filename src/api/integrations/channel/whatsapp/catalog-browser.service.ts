@@ -464,6 +464,7 @@ export class BrowserCatalogService {
         const wpp = (window as any).WPP;
         if (!wpp) return { catalog: [], message: 'WPP not available' };
 
+        const whatsappApi = wpp.whatsapp;
         const productsById = new Map<string, any>();
 
         const addProduct = (rawProduct: any) => {
@@ -474,37 +475,76 @@ export class BrowserCatalogService {
           }
         };
 
-        // Use wa-js public API (WPP.catalog.*)
-        // Method 1: WPP.catalog.getProducts(chatId, count)
-        if (wpp.catalog?.getProducts) {
+        const extractProductsFromCatalog = (catalogEntry: any): any[] => {
+          if (!catalogEntry) return [];
+          const productIndex = catalogEntry.productCollection?._index;
+          if (!productIndex || typeof productIndex !== 'object') return [];
+          return Object.keys(productIndex)
+            .map((productId) => productIndex[productId]?.attributes)
+            .filter(Boolean);
+        };
+
+        // 4-layer fetch strategy (ported from bedones-whatsapp)
+        // Layer 1: queryCatalog with pagination cursor — gets ALL products
+        if (whatsappApi?.functions?.queryCatalog) {
           try {
-            const products: any[] = await wpp.catalog.getProducts(userId, 999);
-            if (Array.isArray(products)) {
-              for (const product of products) {
+            let afterToken: string | undefined = undefined;
+            let safetyCount = 0;
+            while (safetyCount < 500) {
+              const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
+              const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
+              for (const product of pageProducts) {
+                addProduct(product);
+              }
+              const nextAfter = response?.paging?.cursors?.after;
+              if (!nextAfter || nextAfter === afterToken) break;
+              afterToken = nextAfter;
+              safetyCount++;
+            }
+          } catch (error: any) {
+            console.log('queryCatalog error:', error?.message);
+          }
+        }
+
+        // Layer 2: CatalogStore.findQuery — direct store access
+        if (whatsappApi?.CatalogStore?.findQuery) {
+          try {
+            const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
+            if (Array.isArray(results)) {
+              for (const entry of results) {
+                const products = extractProductsFromCatalog(entry);
+                for (const product of products) {
+                  addProduct(product);
+                }
+              }
+            }
+          } catch (error: any) {
+            console.log('CatalogStore.findQuery error:', error?.message);
+          }
+        }
+
+        // Layer 3: WPP.catalog.getMyCatalog — fallback
+        try {
+          const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
+          const fallbackProducts = extractProductsFromCatalog(myCatalog);
+          for (const product of fallbackProducts) {
+            addProduct(product);
+          }
+        } catch (error: any) {
+          console.log('getMyCatalog error:', error?.message);
+        }
+
+        // Layer 4: WPP.catalog.getProducts — last resort
+        if (productsById.size === 0) {
+          try {
+            const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
+            if (Array.isArray(fallbackProducts)) {
+              for (const product of fallbackProducts) {
                 addProduct(product);
               }
             }
           } catch (error: any) {
             console.log('getProducts error:', error?.message);
-          }
-        }
-
-        // Method 2: WPP.catalog.getMyCatalog() — fallback if getProducts returned 0
-        if (productsById.size === 0 && wpp.catalog?.getMyCatalog) {
-          try {
-            const myCatalog: any = await wpp.catalog.getMyCatalog();
-            if (myCatalog) {
-              // CatalogModel has productCollection._index
-              const productIndex = myCatalog.productCollection?._index;
-              if (productIndex && typeof productIndex === 'object') {
-                for (const pid of Object.keys(productIndex)) {
-                  const p = productIndex[pid]?.attributes || productIndex[pid];
-                  if (p) addProduct(p);
-                }
-              }
-            }
-          } catch (error: any) {
-            console.log('getMyCatalog error:', error?.message);
           }
         }
 
