@@ -211,9 +211,38 @@ export class BrowserCatalogService {
     await page.evaluate(waJsCode);
     this.logger.log(`[browser] wa-js injected (${waJsCode.length} chars)`);
 
-    // Wait for WPP to be ready
-    await page.waitForFunction(() => (window as any).WPP && (window as any).WPP.isReady === true, { timeout: 30000 });
-    this.logger.log('[browser] WPP.isReady = true');
+    // Wait for window.WPP to be defined (the library object)
+    try {
+      await page.waitForFunction(() => typeof (window as any).WPP !== 'undefined', { timeout: 10000 });
+      this.logger.log('[browser] window.WPP is defined');
+    } catch {
+      this.logger.warn('[browser] window.WPP not defined after 10s — wa-js injection may have failed');
+      return;
+    }
+
+    // Try to initialize WPP (some versions need explicit init)
+    try {
+      await page.evaluate(async () => {
+        const wpp = (window as any).WPP;
+        if (wpp && !wpp.isReady) {
+          if (typeof wpp.waitReady === 'function') {
+            await wpp.waitReady();
+          } else if (typeof wpp.init === 'function') {
+            await wpp.init();
+          }
+        }
+      });
+    } catch {
+      // Ignore init errors — catalog fetch will check availability
+    }
+
+    // Wait briefly for isReady (best-effort, don't fail)
+    try {
+      await page.waitForFunction(() => (window as any).WPP && (window as any).WPP.isReady === true, { timeout: 15000 });
+      this.logger.log('[browser] WPP.isReady = true');
+    } catch {
+      this.logger.warn('[browser] WPP.isReady not true after 15s — continuing anyway');
+    }
   }
 
   /**
