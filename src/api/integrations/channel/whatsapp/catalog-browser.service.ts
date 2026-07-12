@@ -34,7 +34,6 @@ import {
   BrowserCollection,
   BrowserCollectionsOptions,
   BrowserCollectionsResult,
-  BrowserProduct,
 } from './catalog-browser.types';
 
 // Per-instance client state
@@ -454,124 +453,131 @@ export class BrowserCatalogService {
       throw new BadRequestException('Could not determine WhatsApp user ID');
     }
 
-    const result = await page.evaluate(
-      async (
-        userId: string,
-      ): Promise<any> => {
-        const wpp = (window as any).WPP;
-        if (!wpp) return { catalog: [], message: 'WPP not available' };
+    const result = await page.evaluate(async (userId: string): Promise<any> => {
+      const wpp = (window as any).WPP;
+      if (!wpp) return { catalog: [], message: 'WPP not available' };
 
-        const whatsappApi = wpp.whatsapp;
-        const productsById = new Map<string, any>();
+      const whatsappApi = wpp.whatsapp;
+      const productsById = new Map<string, any>();
 
-        const addProduct = (rawProduct: any) => {
-          const product = rawProduct?.attributes || rawProduct;
-          if (!product?.id) return;
-          if (!productsById.has(product.id)) {
-            productsById.set(product.id, product);
-          }
-        };
-
-        const extractProductsFromCatalog = (catalogEntry: any): any[] => {
-          if (!catalogEntry) return [];
-          const productIndex = catalogEntry.productCollection?._index;
-          if (!productIndex || typeof productIndex !== 'object') return [];
-          return Object.keys(productIndex)
-            .map((productId) => productIndex[productId]?.attributes)
-            .filter(Boolean);
-        };
-
-        // 4-layer fetch strategy (ported from bedones-whatsapp)
-        // Layer 1: queryCatalog with pagination cursor — gets ALL products
-        if (whatsappApi?.functions?.queryCatalog) {
-          try {
-            let afterToken: string | undefined = undefined;
-            let safetyCount = 0;
-            while (safetyCount < 500) {
-              const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
-              const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
-              for (const product of pageProducts) {
-                addProduct(product);
-              }
-              const nextAfter = response?.paging?.cursors?.after;
-              if (!nextAfter || nextAfter === afterToken) break;
-              afterToken = nextAfter;
-              safetyCount++;
-            }
-          } catch (error: any) {
-            console.log('queryCatalog error:', error?.message);
-          }
+      const addProduct = (rawProduct: any) => {
+        const product = rawProduct?.attributes || rawProduct;
+        if (!product?.id) return;
+        if (!productsById.has(product.id)) {
+          productsById.set(product.id, product);
         }
+      };
 
-        // Layer 2: CatalogStore.findQuery — direct store access
-        if (whatsappApi?.CatalogStore?.findQuery) {
-          try {
-            const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
-            if (Array.isArray(results)) {
-              for (const entry of results) {
-                const products = extractProductsFromCatalog(entry);
-                for (const product of products) {
-                  addProduct(product);
-                }
-              }
-            }
-          } catch (error: any) {
-            console.log('CatalogStore.findQuery error:', error?.message);
-          }
-        }
+      const extractProductsFromCatalog = (catalogEntry: any): any[] => {
+        if (!catalogEntry) return [];
+        const productIndex = catalogEntry.productCollection?._index;
+        if (!productIndex || typeof productIndex !== 'object') return [];
+        return Object.keys(productIndex)
+          .map((productId) => productIndex[productId]?.attributes)
+          .filter(Boolean);
+      };
 
-        // Layer 3: WPP.catalog.getMyCatalog — fallback
+      // 4-layer fetch strategy (ported from bedones-whatsapp)
+      // Layer 1: queryCatalog with pagination cursor — gets ALL products
+      if (whatsappApi?.functions?.queryCatalog) {
         try {
-          const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
-          const fallbackProducts = extractProductsFromCatalog(myCatalog);
-          for (const product of fallbackProducts) {
-            addProduct(product);
+          let afterToken: string | undefined = undefined;
+          let safetyCount = 0;
+          while (safetyCount < 500) {
+            const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
+            const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
+            for (const product of pageProducts) {
+              addProduct(product);
+            }
+            const nextAfter = response?.paging?.cursors?.after;
+            if (!nextAfter || nextAfter === afterToken) break;
+            afterToken = nextAfter;
+            safetyCount++;
           }
         } catch (error: any) {
-          console.log('getMyCatalog error:', error?.message);
+          console.log('queryCatalog error:', error?.message);
         }
+      }
 
-        // Layer 4: WPP.catalog.getProducts — last resort
-        if (productsById.size === 0) {
-          try {
-            const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
-            if (Array.isArray(fallbackProducts)) {
-              for (const product of fallbackProducts) {
+      // Layer 2: CatalogStore.findQuery — direct store access
+      if (whatsappApi?.CatalogStore?.findQuery) {
+        try {
+          const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
+          if (Array.isArray(results)) {
+            for (const entry of results) {
+              const products = extractProductsFromCatalog(entry);
+              for (const product of products) {
                 addProduct(product);
               }
             }
-          } catch (error: any) {
-            console.log('getProducts error:', error?.message);
           }
+        } catch (error: any) {
+          console.log('CatalogStore.findQuery error:', error?.message);
         }
+      }
 
-        // Serialize products to plain objects before returning.
-        // WhatsApp product models contain non-serializable properties (methods,
-        // circular references) that cause Puppeteer's page.evaluate to return
-        // undefined. We must extract only serializable fields.
-        const catalog = Array.from(productsById.values()).map((p: any) => ({
-          id: p.id || '',
-          retailer_id: p.retailer_id || p.retailerId || '',
-          name: p.name || '',
-          description: p.description || '',
-          url: p.url || '',
-          currency: p.currency || '',
-          price: p.price != null ? String(p.price) : '',
-          is_hidden: p.is_hidden || false,
-          is_sanctioned: p.is_sanctioned || false,
-          max_available: p.max_available != null ? String(p.max_available) : '',
-          imageCdnUrl: p.imageCdnUrl || p.image_cdn_url || '',
-          additionalImageCdnUrl: Array.isArray(p.additionalImageCdnUrl)
-            ? p.additionalImageCdnUrl
-            : Array.isArray(p.additional_image_cdn_urls)
-              ? p.additional_image_cdn_urls
-              : [],
-        }));
+      // Layer 3: WPP.catalog.getMyCatalog — fallback
+      try {
+        const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
+        const fallbackProducts = extractProductsFromCatalog(myCatalog);
+        for (const product of fallbackProducts) {
+          addProduct(product);
+        }
+      } catch (error: any) {
+        console.log('getMyCatalog error:', error?.message);
+      }
 
-        return { catalog };
-      },
-      wppUserId,
-    );
+      // Layer 4: WPP.catalog.getProducts — last resort
+      if (productsById.size === 0) {
+        try {
+          const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
+          if (Array.isArray(fallbackProducts)) {
+            for (const product of fallbackProducts) {
+              addProduct(product);
+            }
+          }
+        } catch (error: any) {
+          console.log('getProducts error:', error?.message);
+        }
+      }
+
+      // Serialize products: WhatsApp models have getters on prototypes that
+      // aren't captured by direct property access. Use JSON.stringify with
+      // a replacer to get ALL properties including getters, then extract
+      // the fields we need.
+      const catalog = Array.from(productsById.values()).map((p: any) => {
+        let plain: any = {};
+        try {
+          plain = JSON.parse(
+            JSON.stringify(p, (_k, v) => (typeof v === 'function' ? undefined : v)),
+          );
+        } catch {
+          plain = p;
+        }
+        return {
+          id: plain.id || p.id || '',
+          retailer_id: plain.retailer_id || plain.retailerId || '',
+          name: plain.name || p.name || '',
+          description: plain.description || p.description || '',
+          url: plain.url || p.url || '',
+          currency: plain.currency || p.currency || '',
+          price:
+            plain.price != null
+              ? String(plain.price)
+              : p.price != null
+                ? String(p.price)
+                : '',
+          is_hidden: plain.is_hidden || p.is_hidden || false,
+          is_sanctioned: plain.is_sanctioned || p.is_sanctioned || false,
+          max_available:
+            plain.max_available != null ? String(plain.max_available) : '',
+          imageCdnUrl: plain.imageCdnUrl || plain.image_cdn_url || '',
+          additionalImageCdnUrl: plain.additionalImageCdnUrl || plain.additional_image_cdn_urls || [],
+        };
+      });
+
+      return { catalog };
+    }, wppUserId);
 
     // Null check — page.evaluate can return undefined if the page closes
     // or the evaluation times out
