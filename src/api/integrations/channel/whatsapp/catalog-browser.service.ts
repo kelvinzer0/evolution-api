@@ -186,6 +186,36 @@ export class BrowserCatalogService {
   }
 
   /**
+   * Inject @wppconnect/wa-js into the WhatsApp Web page.
+   *
+   * whatsapp-web.js does NOT auto-inject wa-js. Without it, window.WPP is
+   * undefined and all catalog/collection fetch logic fails silently.
+   *
+   * This reads the wa-js bundle from node_modules and evaluates it in the
+   * page context, then waits for WPP.isReady.
+   *
+   * (Ported from bedones-whatsapp's injectWPPIntoPageInternal)
+   */
+  private async injectWaJs(page: any): Promise<void> {
+    const { readFileSync } = require('fs');
+    const wppExists = await page.evaluate(() => typeof (window as any).WPP !== 'undefined');
+    if (wppExists) {
+      this.logger.log('[browser] WPP already loaded in page');
+      return;
+    }
+
+    this.logger.log('[browser] Injecting @wppconnect/wa-js into page...');
+    const waJsPath = require.resolve('@wppconnect/wa-js');
+    const waJsCode = readFileSync(waJsPath, 'utf8');
+    await page.evaluate(waJsCode);
+    this.logger.log(`[browser] wa-js injected (${waJsCode.length} chars)`);
+
+    // Wait for WPP to be ready
+    await page.waitForFunction(() => (window as any).WPP && (window as any).WPP.isReady === true, { timeout: 30000 });
+    this.logger.log('[browser] WPP.isReady = true');
+  }
+
+  /**
    * Get or create a Client for the given instance.
    * Returns once the client is fully ready (authenticated + WA Web loaded).
    */
@@ -261,11 +291,24 @@ export class BrowserCatalogService {
       state.pairingCode = null;
     });
 
-    client.on('ready', () => {
+    client.on('ready', async () => {
       this.logger.log(`[browser] Client ready for instance=${instanceName}`);
       state.ready = true;
       state.qrCode = null;
       state.pairingCode = null;
+
+      // Inject @wppconnect/wa-js into the page — whatsapp-web.js does NOT
+      // auto-inject it. Without this, window.WPP is undefined and all
+      // catalog/collection fetch logic fails silently.
+      // (Same approach as bedones-whatsapp's injectWPPIntoPageInternal)
+      try {
+        const page = client.pupPage;
+        if (page) {
+          await this.injectWaJs(page);
+        }
+      } catch (err) {
+        this.logger.warn(`[browser] Failed to inject wa-js on ready: ${(err as Error).message}`);
+      }
     });
 
     client.on('auth_failure', (msg: string) => {
