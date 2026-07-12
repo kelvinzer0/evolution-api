@@ -1,6 +1,5 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
-import { getCatalogDto } from '@api/dto/business.dto';
-import { getCollectionsDto } from '@api/dto/business.dto';
+import { getCatalogDto, getCollectionsDto } from '@api/dto/business.dto';
 import { businessController } from '@api/server.module';
 import { createMetaErrorResponse } from '@utils/errorResponse';
 import { catalogSchema, collectionsSchema } from '@validate/validate.schema';
