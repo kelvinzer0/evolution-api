@@ -478,6 +478,11 @@ export class BrowserCatalogService {
       };
 
       // 4-layer fetch strategy (ported from bedones-whatsapp)
+      // CRITICAL: serialize each product immediately via JSON.stringify
+      // before adding to Map. WhatsApp product models from queryCatalog and
+      // CatalogStore contain non-serializable prototypes that crash
+      // page.evaluate's return value. Must serialize inside the browser context.
+
       // Layer 1: queryCatalog with pagination cursor — gets ALL products
       if (whatsappApi?.functions?.queryCatalog) {
         try {
@@ -487,7 +492,26 @@ export class BrowserCatalogService {
             const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
             const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
             for (const product of pageProducts) {
-              addProduct(product);
+              // Serialize immediately — product may have non-serializable prototype
+              const attrs = product?.attributes || product;
+              if (attrs?.id) {
+                let plain: any = null;
+                try {
+                  plain = JSON.parse(
+                    JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+                  );
+                } catch {
+                  plain = {
+                    id: attrs.id,
+                    name: attrs.name,
+                    priceAmount1000: attrs.priceAmount1000,
+                    currency: attrs.currency,
+                  };
+                }
+                if (plain && !productsById.has(plain.id)) {
+                  productsById.set(plain.id, plain);
+                }
+              }
             }
             const nextAfter = response?.paging?.cursors?.after;
             if (!nextAfter || nextAfter === afterToken) break;
@@ -500,14 +524,26 @@ export class BrowserCatalogService {
       }
 
       // Layer 2: CatalogStore.findQuery — direct store access
-      if (whatsappApi?.CatalogStore?.findQuery) {
+      if (productsById.size === 0 && whatsappApi?.CatalogStore?.findQuery) {
         try {
           const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
           if (Array.isArray(results)) {
             for (const entry of results) {
               const products = extractProductsFromCatalog(entry);
               for (const product of products) {
-                addProduct(product);
+                if (product?.id) {
+                  let plain: any = null;
+                  try {
+                    plain = JSON.parse(
+                      JSON.stringify(product, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+                    );
+                  } catch {
+                    plain = { id: product.id, name: product.name };
+                  }
+                  if (plain && !productsById.has(plain.id)) {
+                    productsById.set(plain.id, plain);
+                  }
+                }
               }
             }
           }
@@ -517,23 +553,49 @@ export class BrowserCatalogService {
       }
 
       // Layer 3: WPP.catalog.getMyCatalog — fallback
-      try {
-        const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
-        const fallbackProducts = extractProductsFromCatalog(myCatalog);
-        for (const product of fallbackProducts) {
-          addProduct(product);
+      if (productsById.size === 0) {
+        try {
+          const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
+          const fallbackProducts = extractProductsFromCatalog(myCatalog);
+          for (const product of fallbackProducts) {
+            if (product?.id) {
+              let plain: any = null;
+              try {
+                plain = JSON.parse(
+                  JSON.stringify(product, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+                );
+              } catch {
+                plain = { id: product.id, name: product.name };
+              }
+              if (plain && !productsById.has(plain.id)) {
+                productsById.set(plain.id, plain);
+              }
+            }
+          }
+        } catch (error: any) {
+          console.log('getMyCatalog error:', error?.message);
         }
-      } catch (error: any) {
-        console.log('getMyCatalog error:', error?.message);
       }
 
-      // Layer 4: WPP.catalog.getProducts — last resort
+      // Layer 4: WPP.catalog.getProducts — last resort (max 10 products)
       if (productsById.size === 0) {
         try {
           const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
           if (Array.isArray(fallbackProducts)) {
             for (const product of fallbackProducts) {
-              addProduct(product);
+              if (product?.id) {
+                let plain: any = null;
+                try {
+                  plain = JSON.parse(
+                    JSON.stringify(product, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+                  );
+                } catch {
+                  plain = { id: product.id, name: product.name };
+                }
+                if (plain && !productsById.has(plain.id)) {
+                  productsById.set(plain.id, plain);
+                }
+              }
             }
           }
         } catch (error: any) {
@@ -541,16 +603,16 @@ export class BrowserCatalogService {
         }
       }
 
-      // Serialize: return ALL properties via JSON.stringify (captures getters).
-      // Don't filter to specific fields — different layers (queryCatalog vs
-      // getProducts) use different property names. Let the caller see everything.
-      const catalog = Array.from(productsById.values()).map((p: any) => {
-        try {
-          return JSON.parse(JSON.stringify(p, (_k, v) => (typeof v === 'function' ? undefined : v)));
-        } catch {
-          return { id: p.id || '', name: p.name || '', price: p.price || '' };
+      // Products are already serialized (plain objects) — return directly
+      const catalog = Array.from(productsById.values());
+
+      // Add computed 'price' field from priceAmount1000 (WhatsApp stores
+      // prices in 1/1000 units: 3000000 = Rp 3.000)
+      for (const p of catalog) {
+        if (p.priceAmount1000 != null && p.price === undefined) {
+          p.price = String(Math.floor(p.priceAmount1000 / 1000));
         }
-      });
+      }
 
       return { catalog };
     }, wppUserId);
