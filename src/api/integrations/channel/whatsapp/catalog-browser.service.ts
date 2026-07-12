@@ -457,10 +457,7 @@ export class BrowserCatalogService {
     const result = await page.evaluate(
       async (
         userId: string,
-      ): Promise<{
-        catalog: BrowserProduct[];
-        message?: string;
-      }> => {
+      ): Promise<any> => {
         const wpp = (window as any).WPP;
         if (!wpp) return { catalog: [], message: 'WPP not available' };
 
