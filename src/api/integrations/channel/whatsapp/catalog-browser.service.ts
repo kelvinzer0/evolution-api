@@ -23,7 +23,7 @@
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException } from '@exceptions';
-import { existsSync, mkdirSync, rmSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
@@ -197,7 +197,6 @@ export class BrowserCatalogService {
    * (Ported from bedones-whatsapp's injectWPPIntoPageInternal)
    */
   private async injectWaJs(page: any): Promise<void> {
-    const { readFileSync } = require('fs');
     const wppExists = await page.evaluate(() => typeof (window as any).WPP !== 'undefined');
     if (wppExists) {
       this.logger.log('[browser] WPP already loaded in page');
@@ -205,6 +204,8 @@ export class BrowserCatalogService {
     }
 
     this.logger.log('[browser] Injecting @wppconnect/wa-js into page...');
+    // require.resolve is needed because @wppconnect/wa-js doesn't export a path
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const waJsPath = require.resolve('@wppconnect/wa-js');
     const waJsCode = readFileSync(waJsPath, 'utf8');
     await page.evaluate(waJsCode);
