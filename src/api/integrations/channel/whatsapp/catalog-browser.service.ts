@@ -469,72 +469,39 @@ export class BrowserCatalogService {
           .filter(Boolean);
       };
 
-      // 4-layer fetch strategy (ported from bedones-whatsapp)
-      // CRITICAL: serialize each product immediately via JSON.stringify
-      // before adding to Map. WhatsApp product models from queryCatalog and
-      // CatalogStore contain non-serializable prototypes that crash
-      // page.evaluate's return value. Must serialize inside the browser context.
+      // Catalog fetch strategy:
+      // queryCatalog errors with CatalogUnknownError for own catalog (only works
+      // for other businesses' catalogs). Use these methods in order:
+      //
+      // 1. CatalogStore.findQuery — direct store access (most reliable)
+      // 2. WPP.catalog.getMyCatalog — wrapper around catalog store
+      // 3. WPP.catalog.getProducts(uid, 20) — note: count=20 returns 20,
+      //    but count=999 returns only 10 (WhatsApp quirk). Use 20.
+      //    Then try count=10 for any additional products not in first batch.
+      //
+      // All products are serialized immediately via JSON.stringify to avoid
+      // Puppeteer serialization crashes with non-serializable prototypes.
 
-      // Layer 1: queryCatalog with pagination cursor — gets ALL products
-      if (whatsappApi?.functions?.queryCatalog) {
+      const serializeProduct = (p: any): any | null => {
+        if (!p?.id) return null;
         try {
-          let afterToken: string | undefined = undefined;
-          let safetyCount = 0;
-          while (safetyCount < 500) {
-            const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
-            const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
-            for (const product of pageProducts) {
-              // Serialize immediately — product may have non-serializable prototype
-              const attrs = product?.attributes || product;
-              if (attrs?.id) {
-                let plain: any = null;
-                try {
-                  plain = JSON.parse(
-                    JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
-                  );
-                } catch {
-                  plain = {
-                    id: attrs.id,
-                    name: attrs.name,
-                    priceAmount1000: attrs.priceAmount1000,
-                    currency: attrs.currency,
-                  };
-                }
-                if (plain && !productsById.has(plain.id)) {
-                  productsById.set(plain.id, plain);
-                }
-              }
-            }
-            const nextAfter = response?.paging?.cursors?.after;
-            if (!nextAfter || nextAfter === afterToken) break;
-            afterToken = nextAfter;
-            safetyCount++;
-          }
-        } catch (error: any) {
-          console.log('queryCatalog error:', error?.message);
+          return JSON.parse(JSON.stringify(p, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
+        } catch {
+          return { id: p.id, name: p.name, priceAmount1000: p.priceAmount1000, currency: p.currency };
         }
-      }
+      };
 
-      // Layer 2: CatalogStore.findQuery — direct store access
-      if (productsById.size === 0 && whatsappApi?.CatalogStore?.findQuery) {
+      // Method 1: CatalogStore.findQuery — most reliable, returns ALL products
+      if (whatsappApi?.CatalogStore?.findQuery) {
         try {
           const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
           if (Array.isArray(results)) {
             for (const entry of results) {
               const products = extractProductsFromCatalog(entry);
               for (const product of products) {
-                if (product?.id) {
-                  let plain: any = null;
-                  try {
-                    plain = JSON.parse(
-                      JSON.stringify(product, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
-                    );
-                  } catch {
-                    plain = { id: product.id, name: product.name };
-                  }
-                  if (plain && !productsById.has(plain.id)) {
-                    productsById.set(plain.id, plain);
-                  }
+                const plain = serializeProduct(product);
+                if (plain && !productsById.has(plain.id)) {
+                  productsById.set(plain.id, plain);
                 }
               }
             }
@@ -544,24 +511,15 @@ export class BrowserCatalogService {
         }
       }
 
-      // Layer 3: WPP.catalog.getMyCatalog — fallback
+      // Method 2: WPP.catalog.getMyCatalog — fallback
       if (productsById.size === 0) {
         try {
           const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
           const fallbackProducts = extractProductsFromCatalog(myCatalog);
           for (const product of fallbackProducts) {
-            if (product?.id) {
-              let plain: any = null;
-              try {
-                plain = JSON.parse(
-                  JSON.stringify(product, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
-                );
-              } catch {
-                plain = { id: product.id, name: product.name };
-              }
-              if (plain && !productsById.has(plain.id)) {
-                productsById.set(plain.id, plain);
-              }
+            const plain = serializeProduct(product);
+            if (plain && !productsById.has(plain.id)) {
+              productsById.set(plain.id, plain);
             }
           }
         } catch (error: any) {
@@ -569,29 +527,22 @@ export class BrowserCatalogService {
         }
       }
 
-      // Layer 4: WPP.catalog.getProducts — last resort (max 10 products)
-      if (productsById.size === 0) {
+      // Method 3: WPP.catalog.getProducts — count=20 is optimal (count=999
+      // returns only 10 due to WhatsApp quirk). Try multiple counts to
+      // catch any products not in the store.
+      for (const count of [20, 10]) {
         try {
-          const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
-          if (Array.isArray(fallbackProducts)) {
-            for (const product of fallbackProducts) {
-              if (product?.id) {
-                let plain: any = null;
-                try {
-                  plain = JSON.parse(
-                    JSON.stringify(product, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
-                  );
-                } catch {
-                  plain = { id: product.id, name: product.name };
-                }
-                if (plain && !productsById.has(plain.id)) {
-                  productsById.set(plain.id, plain);
-                }
+          const products: any[] = await wpp.catalog?.getProducts?.(userId, count);
+          if (Array.isArray(products)) {
+            for (const product of products) {
+              const plain = serializeProduct(product);
+              if (plain && !productsById.has(plain.id)) {
+                productsById.set(plain.id, plain);
               }
             }
           }
         } catch (error: any) {
-          console.log('getProducts error:', error?.message);
+          console.log(`getProducts(uid, ${count}) error:`, error?.message);
         }
       }
 
