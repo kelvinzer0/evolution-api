@@ -426,103 +426,73 @@ export class BrowserCatalogService {
     // the 'ready' event handler's injectWaJs call completes.)
     await this.injectWaJs(page);
 
+    // Get the authenticated user's WhatsApp ID (needed for catalog API calls)
+    const wppUserId = await page.evaluate(() => {
+      const wpp = (window as any).WPP;
+      const myUser = wpp?.conn?.getMyUserId ? wpp.conn.getMyUserId() : null;
+      return myUser ? myUser._serialized : null;
+    });
+    if (!wppUserId) {
+      throw new BadRequestException('Could not determine WhatsApp user ID');
+    }
+
     const result = await page.evaluate(
-      async (): Promise<{
+      async (
+        userId: string,
+      ): Promise<{
         catalog: BrowserProduct[];
         message?: string;
       }> => {
         const wpp = (window as any).WPP;
         if (!wpp) return { catalog: [], message: 'WPP not available' };
 
-        const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-        const userId = (myUser && myUser._serialized) || '';
-        if (!userId) return { catalog: [], message: 'User ID not found' };
-
-        const whatsappApi = wpp.whatsapp;
-        const productsById = new Map<string, BrowserProduct>();
+        const productsById = new Map<string, any>();
 
         const addProduct = (rawProduct: any) => {
           const product = rawProduct?.attributes || rawProduct;
           if (!product?.id) return;
           if (!productsById.has(product.id)) {
-            productsById.set(product.id, product as BrowserProduct);
+            productsById.set(product.id, product);
           }
         };
 
-        const extractProductsFromCatalog = (catalogEntry: any): any[] => {
-          if (!catalogEntry) return [];
-          const productIndex = catalogEntry.productCollection?._index;
-          if (!productIndex || typeof productIndex !== 'object') return [];
-          return Object.keys(productIndex)
-            .map((productId) => productIndex[productId]?.attributes)
-            .filter(Boolean);
-        };
-
-        // Layer 1: queryCatalog with pagination cursor
-        if (whatsappApi?.functions?.queryCatalog) {
+        // Use wa-js public API (WPP.catalog.*)
+        // Method 1: WPP.catalog.getProducts(chatId, count)
+        if (wpp.catalog?.getProducts) {
           try {
-            let afterToken: string | undefined = undefined;
-            let safetyCount = 0;
-            while (safetyCount < 500) {
-              const response: any = await whatsappApi.functions.queryCatalog(userId, afterToken);
-              const pageProducts: any[] = Array.isArray(response?.data) ? response.data : [];
-              for (const product of pageProducts) {
+            const products: any[] = await wpp.catalog.getProducts(userId, 999);
+            if (Array.isArray(products)) {
+              for (const product of products) {
                 addProduct(product);
               }
-              const nextAfter = response?.paging?.cursors?.after;
-              if (!nextAfter || nextAfter === afterToken) break;
-              afterToken = nextAfter;
-              safetyCount++;
             }
           } catch (error: any) {
-            console.log('queryCatalog unavailable:', error?.message);
+            console.log('getProducts error:', error?.message);
           }
         }
 
-        // Layer 2: CatalogStore.findQuery
-        if (whatsappApi?.CatalogStore?.findQuery) {
+        // Method 2: WPP.catalog.getMyCatalog() — fallback if getProducts returned 0
+        if (productsById.size === 0 && wpp.catalog?.getMyCatalog) {
           try {
-            const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
-            if (Array.isArray(results)) {
-              for (const entry of results) {
-                const products = extractProductsFromCatalog(entry);
-                for (const product of products) {
-                  addProduct(product);
+            const myCatalog: any = await wpp.catalog.getMyCatalog();
+            if (myCatalog) {
+              // CatalogModel has productCollection._index
+              const productIndex = myCatalog.productCollection?._index;
+              if (productIndex && typeof productIndex === 'object') {
+                for (const pid of Object.keys(productIndex)) {
+                  const p = productIndex[pid]?.attributes || productIndex[pid];
+                  if (p) addProduct(p);
                 }
               }
             }
           } catch (error: any) {
-            console.log('CatalogStore.findQuery unavailable:', error?.message);
-          }
-        }
-
-        // Layer 3: WPP.catalog.getMyCatalog
-        try {
-          const myCatalog: any = await wpp.catalog?.getMyCatalog?.();
-          const fallbackProducts = extractProductsFromCatalog(myCatalog);
-          for (const product of fallbackProducts) {
-            addProduct(product);
-          }
-        } catch (error: any) {
-          console.log('getMyCatalog unavailable:', error?.message);
-        }
-
-        // Layer 4: WPP.catalog.getProducts (last resort)
-        if (productsById.size === 0) {
-          try {
-            const fallbackProducts: any[] = await wpp.catalog?.getProducts?.(userId, 999);
-            if (Array.isArray(fallbackProducts)) {
-              for (const product of fallbackProducts) {
-                addProduct(product);
-              }
-            }
-          } catch (error: any) {
-            console.log('getProducts unavailable:', error?.message);
+            console.log('getMyCatalog error:', error?.message);
           }
         }
 
         return { catalog: Array.from(productsById.values()) };
       },
+      wppUserId,
     );
 
     this.logger.log(`[browser] fetchCatalog got ${result.catalog.length} products`);
@@ -573,62 +543,42 @@ export class BrowserCatalogService {
     // Ensure wa-js is injected before fetching collections (idempotent).
     await this.injectWaJs(page);
 
+    // Get the authenticated user's WhatsApp ID
+    const wppUserId = await page.evaluate(() => {
+      const wpp = (window as any).WPP;
+      const myUser = wpp?.conn?.getMyUserId ? wpp.conn.getMyUserId() : null;
+      return myUser ? myUser._serialized : null;
+    });
+    if (!wppUserId) {
+      throw new BadRequestException('Could not determine WhatsApp user ID');
+    }
+
     const result = await page.evaluate(
-      async (): Promise<{
+      async (
+        userId: string,
+      ): Promise<{
         collections: BrowserCollection[];
         message?: string;
       }> => {
         const wpp = (window as any).WPP;
         if (!wpp) return { collections: [], message: 'WPP not available' };
 
-        const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
-        const userId = (myUser && myUser._serialized) || '';
-        if (!userId) return { collections: [], message: 'User ID not found' };
-
-        const whatsappApi = wpp.whatsapp;
         const collections: BrowserCollection[] = [];
 
-        // Method 1: WPP.catalog.getCollections
-        try {
-          const response: any = await wpp.catalog?.getCollections?.(userId);
-          if (Array.isArray(response)) {
-            for (const c of response) {
-              const attrs = c?.attributes || c;
-              if (!attrs?.id) continue;
-              const productIndex = c?.productCollection?._index || attrs?.products?._index;
-              const products: BrowserProduct[] = [];
-              if (productIndex && typeof productIndex === 'object') {
-                for (const pid of Object.keys(productIndex)) {
-                  const p = productIndex[pid]?.attributes || productIndex[pid];
-                  if (p) products.push(p as BrowserProduct);
-                }
-              }
-              collections.push({
-                id: attrs.id,
-                name: attrs.name || '',
-                products,
-                status: attrs.status,
-              });
-            }
-          }
-        } catch (error: any) {
-          console.log('WPP.catalog.getCollections failed:', error?.message);
-        }
-
-        // Method 2: CollectionStore.findQuery fallback
-        if (collections.length === 0 && whatsappApi?.CollectionStore?.findQuery) {
+        // Use wa-js public API: WPP.catalog.getCollections(chatId, qnt, productsCount)
+        if (wpp.catalog?.getCollections) {
           try {
-            const results: any[] = await whatsappApi.CollectionStore.findQuery(userId);
-            if (Array.isArray(results)) {
-              for (const c of results) {
+            const response: any[] = await wpp.catalog.getCollections(userId, 100, 50);
+            if (Array.isArray(response)) {
+              for (const c of response) {
                 const attrs = c?.attributes || c;
                 if (!attrs?.id) continue;
                 const productIndex = c?.productCollection?._index;
-                const products: BrowserProduct[] = [];
+                const products: any[] = [];
                 if (productIndex && typeof productIndex === 'object') {
                   for (const pid of Object.keys(productIndex)) {
                     const p = productIndex[pid]?.attributes || productIndex[pid];
-                    if (p) products.push(p as BrowserProduct);
+                    if (p) products.push(p);
                   }
                 }
                 collections.push({
@@ -640,12 +590,13 @@ export class BrowserCatalogService {
               }
             }
           } catch (error: any) {
-            console.log('CollectionStore.findQuery failed:', error?.message);
+            console.log('WPP.catalog.getCollections error:', error?.message);
           }
         }
 
         return { collections };
       },
+      wppUserId,
     );
 
     this.logger.log(`[browser] fetchCollections got ${result.collections.length} collections`);
