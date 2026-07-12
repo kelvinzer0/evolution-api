@@ -9,11 +9,10 @@
  * the QR code ONCE per WhatsApp account.
  */
 
-import { Injectable, Logger } from '@nestjs/common';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
-import { join } from 'path';
-
+import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
 const SESSION_SUBDIR = 'browser-session';
 
@@ -21,7 +20,6 @@ export interface StoredSessionData {
   [key: string]: unknown;
 }
 
-@Injectable()
 export class BrowserSessionStore {
   private readonly logger = new Logger(BrowserSessionStore.name);
 
@@ -82,8 +80,7 @@ export class BrowserSessionStore {
 
     for (const [file, value] of Object.entries(data)) {
       const fullPath = join(dir, file);
-      const serialized =
-        typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+      const serialized = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
       try {
         writeFileSync(fullPath, serialized, 'utf8');
       } catch (err) {

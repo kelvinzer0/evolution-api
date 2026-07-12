@@ -24,7 +24,8 @@
  *   (Kelvin Yuli Andrian's own implementation, which proves this works)
  */
 
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Logger } from '@config/logger.config';
+import { BadRequestException } from '@exceptions';
 import puppeteer, { Browser, Page } from 'puppeteer-core';
 
 import {
@@ -65,7 +66,7 @@ const FETCH_CATALOG_IN_PAGE = async (): Promise<InPageCatalogResult> => {
     return { catalog: [], message: 'WPP not available — page did not load WhatsApp Web' };
   }
 
-  const myUser = wpp.conn ? wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null : null;
+  const myUser = wpp.conn ? (wpp.conn.getMyUserId ? wpp.conn.getMyUserId() : null) : null;
   const userId = (myUser && myUser._serialized) || '';
   if (!userId) {
     return { catalog: [], message: 'User ID not found — not logged in' };
@@ -251,7 +252,6 @@ const IS_WA_READY_IN_PAGE = async (): Promise<InPageReadyResult> => {
   return { ready: true };
 };
 
-@Injectable()
 export class BrowserCatalogService {
   private readonly logger = new Logger(BrowserCatalogService.name);
   private readonly config: BrowserCatalogConfig;
@@ -293,9 +293,7 @@ export class BrowserCatalogService {
   /**
    * Convenience static method: fetch catalog via browser, or throw if disabled.
    */
-  static async fetchCatalogOrThrow(
-    options: BrowserCatalogOptions,
-  ): Promise<BrowserCatalogResult> {
+  static async fetchCatalogOrThrow(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
       throw new BadRequestException(
@@ -308,9 +306,7 @@ export class BrowserCatalogService {
   /**
    * Convenience static method: fetch collections via browser.
    */
-  static async fetchCollectionsOrThrow(
-    options: BrowserCollectionsOptions,
-  ): Promise<BrowserCollectionsResult> {
+  static async fetchCollectionsOrThrow(options: BrowserCollectionsOptions): Promise<BrowserCollectionsResult> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
       throw new BadRequestException(
@@ -328,12 +324,9 @@ export class BrowserCatalogService {
     const idleTimeoutMs = parseInt(process.env.CATALOG_BROWSER_IDLE_TIMEOUT_MS || '600000', 10);
     const maxSessions = parseInt(process.env.CATALOG_BROWSER_MAX_SESSIONS || '5', 10);
     const headlessEnv = (process.env.CATALOG_BROWSER_HEADLESS || 'true').toLowerCase();
-    const headless: boolean | 'shell' =
-      headlessEnv === 'shell' ? 'shell' : headlessEnv === 'false' ? false : true;
+    const headless: boolean | 'shell' = headlessEnv === 'shell' ? 'shell' : headlessEnv === 'false' ? false : true;
     const executablePath =
-      process.env.PUPPETEER_EXECUTABLE_PATH ||
-      process.env.CHROMIUM_PATH ||
-      '/usr/bin/chromium-browser';
+      process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
 
     return {
       enabled,
@@ -359,9 +352,7 @@ export class BrowserCatalogService {
    */
   async fetchCatalog(options: BrowserCatalogOptions): Promise<BrowserCatalogResult> {
     if (!this.config.enabled) {
-      throw new BadRequestException(
-        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
-      );
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
     }
 
     const { jid, instanceName } = options;
@@ -419,13 +410,9 @@ export class BrowserCatalogService {
   /**
    * Public entry: fetch collections via browser.
    */
-  async fetchCollections(
-    options: BrowserCollectionsOptions,
-  ): Promise<BrowserCollectionsResult> {
+  async fetchCollections(options: BrowserCollectionsOptions): Promise<BrowserCollectionsResult> {
     if (!this.config.enabled) {
-      throw new BadRequestException(
-        'Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.',
-      );
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
     }
 
     const { jid, instanceName } = options;
@@ -552,11 +539,7 @@ export class BrowserCatalogService {
    * Ensure a QR code is available for the user to scan.
    * Returns the QR data URL if authentication is required.
    */
-  private async ensureQrCode(
-    jid: string,
-    instanceName: string,
-    page: Page,
-  ): Promise<string | null> {
+  private async ensureQrCode(jid: string, instanceName: string, page: Page): Promise<string | null> {
     // Check if we already have a pending QR for this JID
     const existing = this.pendingQr.get(jid);
     if (existing) return existing;
