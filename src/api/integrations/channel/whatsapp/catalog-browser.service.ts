@@ -200,6 +200,8 @@ export class BrowserCatalogService {
     const wppExists = await page.evaluate(() => typeof (window as any).WPP !== 'undefined');
     if (wppExists) {
       this.logger.log('[browser] WPP already loaded in page');
+      // Still ensure it's ready
+      await this.waitForWppReady(page);
       return;
     }
 
@@ -217,31 +219,81 @@ export class BrowserCatalogService {
       this.logger.log('[browser] window.WPP is defined');
     } catch {
       this.logger.warn('[browser] window.WPP not defined after 10s — wa-js injection may have failed');
-      return;
+      throw new BadRequestException('Failed to inject wa-js: window.WPP not defined');
     }
 
-    // Try to initialize WPP (some versions need explicit init)
-    try {
-      await page.evaluate(async () => {
-        const wpp = (window as any).WPP;
-        if (wpp && !wpp.isReady) {
-          if (typeof wpp.waitReady === 'function') {
-            await wpp.waitReady();
-          } else if (typeof wpp.init === 'function') {
-            await wpp.init();
-          }
+    // Wait for WPP to be fully ready (webpack modules loaded)
+    await this.waitForWppReady(page);
+  }
+
+  /**
+   * Wait for WPP.isFullReady === true using the onFullReady callback.
+   *
+   * wa-js exposes onFullReady(callback) — async callback that fires when ALL
+   * webpack modules are loaded. Without waiting, calling WPP.conn.getMyUserId()
+   * crashes with "Cannot read properties of undefined (reading 'm')" because
+   * the underlying webpack module isn't loaded yet.
+   */
+  private async waitForWppReady(page: any): Promise<void> {
+    this.logger.log('[browser] Waiting for WPP.isFullReady...');
+
+    // Use page.evaluate to set up onFullReady callback that resolves a promise
+    const ready = await page.evaluate(async () => {
+      const wpp = (window as any).WPP;
+      if (!wpp) return { ready: false, error: 'WPP not defined' };
+
+      // Already ready?
+      if (wpp.isFullReady) return { ready: true, immediate: true };
+      if (wpp.isReady) return { ready: true, immediate: true, isFullReady: false };
+
+      // Wait via onFullReady callback (preferred) or onReady as fallback
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          resolve({
+            ready: wpp.isReady || wpp.isFullReady,
+            timeout: true,
+            isReady: wpp.isReady,
+            isFullReady: wpp.isFullReady,
+          });
+        }, 60000); // 60s timeout
+
+        const onSuccess = () => {
+          clearTimeout(timeout);
+          resolve({ ready: true, via: 'callback' });
+        };
+
+        if (typeof wpp.onFullReady === 'function') {
+          wpp.onFullReady(onSuccess);
+        } else if (typeof wpp.onReady === 'function') {
+          wpp.onReady(onSuccess);
+        } else {
+          // Fallback: poll isReady
+          clearTimeout(timeout);
+          const pollTimer = setInterval(() => {
+            if (wpp.isReady || wpp.isFullReady) {
+              clearInterval(pollTimer);
+              resolve({ ready: true, via: 'poll' });
+            }
+          }, 500);
+          setTimeout(() => {
+            clearInterval(pollTimer);
+            resolve({ ready: wpp.isReady || wpp.isFullReady, timeout: true });
+          }, 60000);
         }
       });
-    } catch {
-      // Ignore init errors — catalog fetch will check availability
-    }
+    });
 
-    // Wait briefly for isReady (best-effort, don't fail)
-    try {
-      await page.waitForFunction(() => (window as any).WPP && (window as any).WPP.isReady === true, { timeout: 15000 });
-      this.logger.log('[browser] WPP.isReady = true');
-    } catch {
-      this.logger.warn('[browser] WPP.isReady not true after 15s — continuing anyway');
+    if (ready.ready) {
+      this.logger.log(
+        `[browser] WPP ready (immediate=${ready.immediate || false}, via=${ready.via || 'callback'}, isReady=${ready.isReady}, isFullReady=${ready.isFullReady})`,
+      );
+    } else {
+      this.logger.warn(
+        `[browser] WPP NOT ready after 60s (isReady=${ready.isReady}, isFullReady=${ready.isFullReady})`,
+      );
+      throw new BadRequestException(
+        'WPP library not ready after 60s. WhatsApp Web may have changed its internal structure.',
+      );
     }
   }
 
