@@ -784,14 +784,34 @@ export class BrowserCatalogService {
               for (const c of cols) {
                 const a = c?.attributes || c;
                 if (!a?.id) continue;
-                // Check if products are already embedded in the collection model
-                const embeddedProducts = c?.products || a?.products;
+                // Products are embedded in the model's attributes (Backbone.Model pattern).
+                // Diagnostic confirmed: firstCollectionModelSample shows "products": "Array(55)"
+                // — the products array lives at a.products (attributes level), NOT c.products
+                // (model level, which returns undefined for Backbone getters).
+                // Try multiple access patterns to be safe:
+                //   1. a.products — attributes.products (Backbone standard)
+                //   2. c.get('products') — Backbone model getter
+                //   3. c.products — direct property (if plain object, not Model)
+                let embeddedProducts: any = a?.products;
+                if (!Array.isArray(embeddedProducts) && typeof (c as any)?.get === 'function') {
+                  try {
+                    embeddedProducts = (c as any).get('products');
+                  } catch {
+                    // ignore
+                  }
+                }
+                if (!Array.isArray(embeddedProducts)) {
+                  embeddedProducts = (c as any)?.products;
+                }
+                const serializedProducts = Array.isArray(embeddedProducts)
+                  ? embeddedProducts.map(serializeProduct).filter(Boolean)
+                  : [];
                 collections.push({
                   id: String(a.id),
                   name: a.name || '',
-                  products: Array.isArray(embeddedProducts) ? embeddedProducts.map(serializeProduct).filter(Boolean) : [],
+                  products: serializedProducts,
                   status: a.reviewStatus || a.status,
-                  totalItemsCount: a.totalItemsCount || 0,
+                  totalItemsCount: a.totalItemsCount || serializedProducts.length,
                 });
               }
             }
