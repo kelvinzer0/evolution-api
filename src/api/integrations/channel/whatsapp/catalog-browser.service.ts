@@ -99,6 +99,32 @@ export class BrowserCatalogService {
     return svc.fetchCollections(options);
   }
 
+  /**
+   * Static wrapper for fetchCollectionProductsFallback.
+   * Called by whatsapp.baileys.service.ts when Baileys returns 0 products.
+   */
+  static async fetchCollectionProductsFallback(options: {
+    instanceName: string;
+    collectionIds: Array<{ id: string; name?: string }>;
+    productsPerCollection: number;
+  }): Promise<{
+    productsByCollectionId: Array<{
+      collectionId: string;
+      collectionName?: string;
+      products: any[];
+      method: string;
+      error?: string;
+    }>;
+  }> {
+    const svc = BrowserCatalogService.getInstance();
+    if (!svc) {
+      throw new BadRequestException(
+        'Browser catalog service is not initialized. Set CATALOG_BROWSER_ENABLED=true to enable.',
+      );
+    }
+    return svc.fetchCollectionProductsFallback(options);
+  }
+
   private loadConfig(): BrowserCatalogConfig {
     const enabled = (process.env.CATALOG_BROWSER_ENABLED || 'false').toLowerCase() === 'true';
     const idleTimeoutMs = parseInt(process.env.CATALOG_BROWSER_IDLE_TIMEOUT_MS || '600000', 10);
@@ -711,6 +737,234 @@ export class BrowserCatalogService {
       collectionsLength: result.collections.length,
       collections: result.collections,
       source: 'browser',
+    };
+  }
+
+  /**
+   * Browser fallback: fetch products per collection via wa-js webpack modules.
+   *
+   * This is called when Baileys' protocol-level getCollections returns 0
+   * products (e.g. anti-bot blocked, or instance not fully business-verified).
+   *
+   * Strategy (tries multiple methods in order):
+   *   1. WPP.whatsapp.ProductCollCollection.findCollectionProducts(collectionId, limit)
+   *      — same method web.whatsapp.com's UI uses when you click a collection
+   *   2. WPP.whatsapp.CatalogCollection.findCollectionMembership(catalogWid, productId)
+   *      — alternative: check membership for each known product (slower)
+   *   3. Iterate CatalogStore.productCollection._index and filter by collectionId
+   *      — last resort: scan all cached products (works only if catalog was
+   *        already fetched via getCatalog before this call)
+   *
+   * Returns one entry per input collection (even if 0 products or error).
+   */
+  async fetchCollectionProductsFallback(options: {
+    instanceName: string;
+    collectionIds: Array<{ id: string; name?: string }>;
+    productsPerCollection: number;
+  }): Promise<{
+    productsByCollectionId: Array<{
+      collectionId: string;
+      collectionName?: string;
+      products: any[];
+      method: string;
+      error?: string;
+    }>;
+  }> {
+    if (!this.config.enabled) {
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
+    }
+
+    const { instanceName, collectionIds, productsPerCollection } = options;
+    this.logger.log(
+      `[browser-fallback] Fetching products for ${collectionIds.length} collections ` +
+        `(productsPerCollection=${productsPerCollection})`,
+    );
+
+    let state: InstanceClientState;
+    try {
+      state = await this.getReadyClient(instanceName);
+    } catch (err) {
+      throw new BadRequestException(`Browser client not ready: ${(err as Error)?.message}`);
+    }
+
+    if (!state.ready || state.qrCode) {
+      throw new BadRequestException('Browser session not authenticated. Scan QR code first.');
+    }
+
+    const page = await state.client.pupPage;
+    if (!page) {
+      throw new BadRequestException('WhatsApp Web page not available');
+    }
+
+    await this.injectWaJs(page);
+
+    const wppUserId = await page.evaluate(() => {
+      const wpp = (window as any).WPP;
+      const myUser = wpp?.conn?.getMyUserId ? wpp.conn.getMyUserId() : null;
+      return myUser ? myUser._serialized : null;
+    });
+    if (!wppUserId) {
+      throw new BadRequestException('Could not determine WhatsApp user ID');
+    }
+
+    // Execute fallback strategy in page context.
+    // We pass the list of collection IDs and let the page code try each method.
+    const result = await page.evaluate(
+      async (userId: string, collections: Array<{ id: string; name?: string }>, limit: number): Promise<any> => {
+        const wpp = (window as any).WPP;
+        if (!wpp) return { results: [], error: 'WPP not available' };
+
+        const wa = wpp.whatsapp;
+        if (!wa) return { results: [], error: 'WPP.whatsapp not available' };
+
+        // Helper: serialize WhatsApp model to plain object
+        const serializeProduct = (p: any): any | null => {
+          if (!p?.id) return null;
+          try {
+            return JSON.parse(JSON.stringify(p, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
+          } catch {
+            return {
+              id: p.id,
+              name: p.name,
+              priceAmount1000: p.priceAmount1000,
+              currency: p.currency,
+            };
+          }
+        };
+
+        // Helper: try multiple methods to get products for a collection
+        const getProductsForCollection = async (
+          collectionId: string,
+          productLimit: number,
+        ): Promise<{ products: any[]; method: string; error?: string }> => {
+          // Method 1: ProductCollCollection.findCollectionProducts
+          //   - Same method web.whatsapp.com UI uses
+          //   - Signature: findCollectionProducts(collectionWid, limit)
+          try {
+            if (wa.ProductCollCollection?.findCollectionProducts) {
+              const wid = wa.createWid ? wa.createWid(collectionId) : { _serialized: collectionId, id: collectionId };
+              const products: any[] = await wa.ProductCollCollection.findCollectionProducts(wid, productLimit);
+              if (Array.isArray(products) && products.length > 0) {
+                return {
+                  products: products.map(serializeProduct).filter(Boolean),
+                  method: 'ProductCollCollection.findCollectionProducts',
+                };
+              }
+            }
+          } catch (e: any) {
+            console.log(`findCollectionProducts error for ${collectionId}:`, e?.message);
+          }
+
+          // Method 2: CollectionProductListRequest (GraphQL-style request)
+          //   - Android APK has CollectionProductListRequest class; web might
+          //     have similar via GraphQL module
+          //   - Try accessing through the catalog module
+          try {
+            if (wa.CatalogCollection?.findCollectionMembership) {
+              // This method checks if a product is in a collection. Slow but works.
+              const catalogWid = wa.createWid ? wa.createWid(userId) : { _serialized: userId, id: userId };
+              // Get all products from catalog store
+              const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(catalogWid) : null;
+              if (Array.isArray(catalogModels) && catalogModels.length > 0) {
+                const catalogModel = catalogModels[0];
+                const allProducts = catalogModel?.productCollection?._index
+                  ? Object.values(catalogModel.productCollection._index)
+                  : [];
+                const memberProducts: any[] = [];
+                for (const p of allProducts) {
+                  if (memberProducts.length >= productLimit) break;
+                  try {
+                    const productModel = (p as any)?.attributes || p;
+                    const productId = productModel?.id;
+                    if (!productId) continue;
+                    const isMember = await wa.CatalogCollection.findCollectionMembership(catalogWid, productId);
+                    if (isMember) {
+                      const plain = serializeProduct(productModel);
+                      if (plain) memberProducts.push(plain);
+                    }
+                  } catch {
+                    // skip individual product errors
+                  }
+                }
+                if (memberProducts.length > 0) {
+                  return {
+                    products: memberProducts,
+                    method: 'CatalogCollection.findCollectionMembership',
+                  };
+                }
+              }
+            }
+          } catch (e: any) {
+            console.log(`findCollectionMembership error for ${collectionId}:`, e?.message);
+          }
+
+          // Method 3: Scan CatalogStore products for collectionId field
+          //   - Some WhatsApp versions store collectionId on ProductModel
+          try {
+            const catalogWid = wa.createWid ? wa.createWid(userId) : { _serialized: userId, id: userId };
+            const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(catalogWid) : null;
+            if (Array.isArray(catalogModels) && catalogModels.length > 0) {
+              const catalogModel = catalogModels[0];
+              const allProducts = catalogModel?.productCollection?._index
+                ? Object.values(catalogModel.productCollection._index)
+                : [];
+              const matching = allProducts
+                .map((p: any) => p?.attributes || p)
+                .filter((p: any) => {
+                  // Check various possible field names
+                  return (
+                    p?.collectionId === collectionId ||
+                    p?.collection_id === collectionId ||
+                    (Array.isArray(p?.collectionIds) && p.collectionIds.includes(collectionId)) ||
+                    (Array.isArray(p?.collection_ids) && p.collection_ids.includes(collectionId))
+                  );
+                })
+                .map(serializeProduct)
+                .filter(Boolean)
+                .slice(0, productLimit);
+              if (matching.length > 0) {
+                return {
+                  products: matching,
+                  method: 'CatalogStore.scanByCollectionId',
+                };
+              }
+            }
+          } catch (e: any) {
+            console.log(`CatalogStore.scan error for ${collectionId}:`, e?.message);
+          }
+
+          return { products: [], method: 'none', error: 'All methods returned 0 products' };
+        };
+
+        // Process each collection (sequentially to avoid rate limiting)
+        const results: any[] = [];
+        for (const col of collections) {
+          const r = await getProductsForCollection(col.id, limit);
+          results.push({
+            collectionId: col.id,
+            collectionName: col.name,
+            products: r.products,
+            method: r.method,
+            error: r.error,
+          });
+          // Small delay between collections
+          await new Promise((res) => setTimeout(res, 300));
+        }
+
+        return { results };
+      },
+      wppUserId,
+      collectionIds,
+      productsPerCollection,
+    );
+
+    this.logger.log(
+      `[browser-fallback] Done. ${result?.results?.filter((r: any) => r.products?.length > 0).length || 0} ` +
+        `collections have products, total: ${result?.results?.reduce((s: number, r: any) => s + (r.products?.length || 0), 0) || 0}`,
+    );
+
+    return {
+      productsByCollectionId: result?.results || [],
     };
   }
 

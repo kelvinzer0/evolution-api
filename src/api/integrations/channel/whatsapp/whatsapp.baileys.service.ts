@@ -5021,6 +5021,9 @@ export class BaileysStartupService extends ChannelStartupService {
       const jid = data.number ? createJid(data.number) : this.client?.user?.id;
       const limit = Number(data.limit) || 100;
 
+      // Time the Baileys call for diagnostics
+      const baileysStart = Date.now();
+
       // Fire both requests in parallel — they hit different code paths
       // (browser automates web.whatsapp.com; Baileys sends IQ stanza
       // through the open WhatsApp socket on this Evolution API instance).
@@ -5032,10 +5035,40 @@ export class BaileysStartupService extends ChannelStartupService {
           // fetchCollections wrapper's isBusiness gate (which would block
           // us if fetchBusinessProfile reports isBusiness=false).
           try {
-            return await this.getCollections(jid, limit);
+            const result = await this.getCollections(jid, limit);
+            const durationMs = Date.now() - baileysStart;
+            // Detailed logging — what did Baileys actually return?
+            const rawLen = Array.isArray(result) ? result.length : -1;
+            const validCols = Array.isArray(result) ? result.filter((c: any) => c?.id) : [];
+            const totalProds = validCols.reduce(
+              (sum: number, c: any) => sum + (Array.isArray(c?.products) ? c.products.length : 0),
+              0,
+            );
+            this.logger.log(
+              `[hybrid] Baileys getCollections(jid=${jid}, limit=${limit}) returned ` +
+                `array.length=${rawLen}, valid=${validCols.length}, totalProducts=${totalProds} ` +
+                `in ${durationMs}ms`,
+            );
+            if (validCols.length > 0) {
+              // Log sample collection for debugging
+              const sample = validCols[0];
+              this.logger.log(
+                `[hybrid] Sample Baileys collection: id=${sample.id}, name=${(sample as any).name}, ` +
+                  `products.length=${(sample as any).products?.length || 0}`,
+              );
+            } else if (rawLen > 0) {
+              // Array returned but no valid collections — log structure
+              this.logger.warn(
+                `[hybrid] Baileys returned ${rawLen} items but none had valid id. ` +
+                  `First item: ${JSON.stringify(result?.[0])?.slice(0, 200)}`,
+              );
+            }
+            return result;
           } catch (err) {
+            const durationMs = Date.now() - baileysStart;
             this.logger.warn(
-              `[hybrid] Baileys getCollections failed: ${(err as Error)?.message || err}. ` +
+              `[hybrid] Baileys getCollections failed after ${durationMs}ms: ` +
+                `${(err as Error)?.message || err}. ` +
                 `Falling back to browser-only metadata (no product mapping).`,
             );
             return null;
@@ -5055,25 +5088,86 @@ export class BaileysStartupService extends ChannelStartupService {
       // for product→collection mapping).
       const productsByCollectionId = new Map<string, any[]>();
       let totalBaileysProducts = 0;
+      let baileysValidCollections = 0;
       if (baileysCollections && Array.isArray(baileysCollections)) {
         for (const col of baileysCollections) {
           if (col?.id && Array.isArray((col as any).products)) {
             productsByCollectionId.set(col.id, (col as any).products as any[]);
             totalBaileysProducts += ((col as any).products as any[]).length;
+            baileysValidCollections++;
           }
         }
       }
 
-      // Merge: enrich browser collections with Baileys product arrays.
+      // === Browser cross-reference fallback ===
+      //
+      // If Baileys returned 0 products (e.g. anti-bot blocked, or instance
+      // not fully business-verified for protocol queries), try fetching
+      // products per collection directly via wa-js's webpack modules.
+      //
+      // Method: WPP.whatsapp.ProductCollCollection.findCollectionProducts(collectionId, limit)
+      //   — this is the same method web.whatsapp.com's UI uses when you
+      //     click on a collection to see its products.
+      //   — returns ProductModel[] which we serialize and attach.
+      //
+      // This is slow (one round-trip per collection), so only triggered
+      // when Baileys failed.
+      let browserFallbackProducts = 0;
+      const browserFallbackDebug: any[] = [];
+      if (totalBaileysProducts === 0 && (base.collections || []).length > 0) {
+        this.logger.log(
+          `[hybrid] Baileys returned 0 products — trying browser fallback ` +
+            `(WPP.whatsapp.ProductCollCollection.findCollectionProducts) for ${base.collections.length} collections`,
+        );
+        try {
+          const fallbackResult = await BrowserCatalogService.fetchCollectionProductsFallback({
+            instanceName,
+            collectionIds: (base.collections || []).map((c: any) => ({ id: c.id, name: c.name })),
+            productsPerCollection: limit,
+          });
+          if (fallbackResult && Array.isArray(fallbackResult.productsByCollectionId)) {
+            for (const item of fallbackResult.productsByCollectionId) {
+              if (item?.collectionId && Array.isArray(item.products) && item.products.length > 0) {
+                productsByCollectionId.set(item.collectionId, item.products);
+                browserFallbackProducts += item.products.length;
+                browserFallbackDebug.push({
+                  collectionId: item.collectionId,
+                  collectionName: item.collectionName,
+                  productCount: item.products.length,
+                  method: item.method,
+                  error: item.error,
+                });
+              }
+            }
+            this.logger.log(
+              `[hybrid] Browser fallback got ${browserFallbackProducts} products across ` +
+                `${fallbackResult.productsByCollectionId.filter((i: any) => i.products?.length > 0).length} collections`,
+            );
+          }
+        } catch (err) {
+          this.logger.warn(
+            `[hybrid] Browser fallback failed: ${(err as Error)?.message || err}. ` +
+              `Continuing with browser-only metadata.`,
+          );
+        }
+      }
+
+      // Merge: enrich browser collections with Baileys (or browser fallback) product arrays.
       const mergedCollections = (base.collections || []).map((c: any) => {
-        const baileysProducts = productsByCollectionId.get(c.id) || [];
+        const products = productsByCollectionId.get(c.id) || [];
         return {
           ...c,
-          products: baileysProducts,
-          productsLength: baileysProducts.length,
+          products,
+          productsLength: products.length,
           // Prefer browser's totalItemsCount when present; fall back to
-          // the actual count of products we got from Baileys.
-          totalItemsCount: c.totalItemsCount || baileysProducts.length,
+          // the actual count of products we got.
+          totalItemsCount: c.totalItemsCount || products.length,
+          mappingSource:
+            baileysValidCollections > 0 && productsByCollectionId.has(c.id)
+              ? 'baileys'
+              : browserFallbackProducts > 0 && productsByCollectionId.has(c.id)
+                ? 'browser-fallback'
+                : 'none',
         };
       });
 
@@ -5083,18 +5177,25 @@ export class BaileysStartupService extends ChannelStartupService {
       if (baileysCollections) {
         for (const col of baileysCollections) {
           if (col?.id && !browserIds.has(col.id)) {
+            const prods = (col as any).products || [];
             mergedCollections.push({
               id: col.id,
               name: (col as any).name || '',
-              products: (col as any).products || [],
-              productsLength: ((col as any).products || []).length,
+              products: prods,
+              productsLength: prods.length,
               status: (col as any).status,
-              totalItemsCount: ((col as any).products || []).length,
+              totalItemsCount: prods.length,
               source: 'baileys-only',
+              mappingSource: 'baileys',
             });
           }
         }
       }
+
+      const finalTotalProducts = mergedCollections.reduce(
+        (sum: number, c: any) => sum + (Array.isArray(c.products) ? c.products.length : 0),
+        0,
+      );
 
       return {
         wuid: base.wuid,
@@ -5104,10 +5205,14 @@ export class BaileysStartupService extends ChannelStartupService {
         collectionsLength: mergedCollections.length,
         collections: mergedCollections,
         source: 'hybrid',
-        // Diagnostics: tells the caller whether product mapping is available
-        baileysCollectionsCount: baileysCollections?.length || 0,
+        // Diagnostics
+        baileysCollectionsCount: baileysValidCollections,
         baileysProductsCount: totalBaileysProducts,
         baileysOk: !!baileysCollections,
+        browserFallbackUsed: browserFallbackProducts > 0,
+        browserFallbackProductsCount: browserFallbackProducts,
+        browserFallbackDebug: browserFallbackDebug.length > 0 ? browserFallbackDebug : undefined,
+        totalProductsMapped: finalTotalProducts,
       };
     }
     // === End hybrid routing ===
