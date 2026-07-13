@@ -816,9 +816,28 @@ export class BrowserCatalogService {
           const productsByCollectionId = new Map<string, any[]>();
           const perCollectionDebug: any[] = [];
 
+          // === Pre-step: Populate ProductCollCollection store ===
+          // Diagnostic showed productCollCollectionLength: 0 — store is EMPTY.
+          // getCollections only returns metadata, doesn't populate products.
+          // We need to call findCollectionsList to fetch collection products.
+          if (productCollCollection?.findCollectionsList) {
+            try {
+              const userWid = makeWid(userId);
+              diag.findCollectionsListCalled = true;
+              await productCollCollection.findCollectionsList(userWid, limit, limit);
+              diag.productCollCollectionLengthAfter = productCollCollection.length;
+              // Re-check methods availability
+              diag.productCollCollectionHasAfter = {
+                findCollectionProducts: typeof productCollCollection.findCollectionProducts === 'function',
+                getCollectionModels: typeof productCollCollection.getCollectionModels === 'function',
+                findCollectionsList: typeof productCollCollection.findCollectionsList === 'function',
+              };
+            } catch (e: any) {
+              diag.findCollectionsListError = e?.message;
+            }
+          }
+
           // === Pre-step: Check catalogModel._products field ===
-          // Diagnostic showed catalogModel has `_products` field — this might be
-          // a Map<collectionId, ProductModel[]> that gets populated by getCollections.
           let catalogModelProducts: any = null;
           if (catalogModel?._products) {
             catalogModelProducts = catalogModel._products;
@@ -826,7 +845,6 @@ export class BrowserCatalogService {
             diag.catalogModelProductsIsArray = Array.isArray(catalogModelProducts);
             diag.catalogModelProductsKeys = Object.keys(catalogModelProducts).slice(0, 20);
             diag.catalogModelProductsLength = catalogModelProducts.length;
-            // Check if it's a Map
             if (catalogModelProducts instanceof Map) {
               diag.catalogModelProductsIsMap = true;
               diag.catalogModelProductsMapSize = catalogModelProducts.size;
@@ -841,44 +859,60 @@ export class BrowserCatalogService {
             let method = 'none';
             const attempts: any[] = [];
 
-            // Method A: getCollectionModels(collectionId, limit)
-            //   - Diagnostic showed getCollectionModels EXISTS on ProductCollCollection
-            //   - This is likely the correct method (not findCollectionProducts
-            //     which crashed with "Cannot read properties of undefined")
-            //   - Returns ProductCollModel[] or ProductModel[] for the collection
-            if (productCollCollection?.getCollectionModels) {
+            // Method A: findCollectionMembership(collectionWid) — SINGLE arg
+            //   - Might return all products that are members of this collection
+            //   - Only 1 async call per collection (9 total) — fast
+            if (wa.CatalogStore?.findCollectionMembership) {
               try {
-                attempts.push({ method: 'getCollectionModels', collectionId: colId });
-                const result: any = await productCollCollection.getCollectionModels(colId, colLimit);
+                const colWid = makeWid(colId);
+                attempts.push({ method: 'findCollectionMembership(single)', collectionId: colId });
+                const result: any = await wa.CatalogStore.findCollectionMembership(colWid);
                 attempts[attempts.length - 1].result = Array.isArray(result)
                   ? `${result.length} items`
-                  : `non-array: ${typeof result}`;
+                  : `type: ${typeof result}`;
                 if (Array.isArray(result) && result.length > 0) {
                   products = result.map(serializeProduct).filter(Boolean);
-                  method = 'ProductCollCollection.getCollectionModels';
+                  method = 'CatalogStore.findCollectionMembership(single)';
                 }
               } catch (e: any) {
-                attempts.push({ method: 'getCollectionModels', error: e?.message });
+                attempts.push({ method: 'findCollectionMembership(single)', error: e?.message });
               }
             }
 
-            // Method A2: findCollectionProducts with collectionId as STRING (not Wid)
-            //   - Previous attempt with Wid failed: "Cannot read properties of undefined (reading 'id')"
-            //   - Collection IDs are numeric strings like "2066810427554462", not JIDs
-            //   - Try passing the raw string instead of a Wid object
-            if (products.length === 0 && productCollCollection?.findCollectionProducts) {
+            // Method A2: findCollectionMembership(catalogWid, collectionWid) — TWO args
+            if (products.length === 0 && wa.CatalogStore?.findCollectionMembership) {
               try {
-                attempts.push({ method: 'findCollectionProducts(string)', collectionId: colId });
-                const result: any[] = await productCollCollection.findCollectionProducts(colId, colLimit);
+                const userWid = makeWid(userId);
+                const colWid = makeWid(colId);
+                attempts.push({ method: 'findCollectionMembership(two)', collectionId: colId });
+                const result: any = await wa.CatalogStore.findCollectionMembership(userWid, colWid);
                 attempts[attempts.length - 1].result = Array.isArray(result)
-                  ? `${result.length} products`
-                  : `non-array: ${typeof result}`;
+                  ? `${result.length} items`
+                  : `type: ${typeof result}`;
                 if (Array.isArray(result) && result.length > 0) {
                   products = result.map(serializeProduct).filter(Boolean);
-                  method = 'ProductCollCollection.findCollectionProducts(string)';
+                  method = 'CatalogStore.findCollectionMembership(two)';
                 }
               } catch (e: any) {
-                attempts.push({ method: 'findCollectionProducts(string)', error: e?.message });
+                attempts.push({ method: 'findCollectionMembership(two)', error: e?.message });
+              }
+            }
+
+            // Method A3: getCollectionModels with Wid (not string)
+            if (products.length === 0 && productCollCollection?.getCollectionModels) {
+              try {
+                const colWid = makeWid(colId);
+                attempts.push({ method: 'getCollectionModels(wid)', collectionId: colId });
+                const result: any = await productCollCollection.getCollectionModels(colWid, colLimit);
+                attempts[attempts.length - 1].result = Array.isArray(result)
+                  ? `${result.length} items`
+                  : `type: ${typeof result}`;
+                if (Array.isArray(result) && result.length > 0) {
+                  products = result.map(serializeProduct).filter(Boolean);
+                  method = 'ProductCollCollection.getCollectionModels(wid)';
+                }
+              } catch (e: any) {
+                attempts.push({ method: 'getCollectionModels(wid)', error: e?.message });
               }
             }
 
@@ -916,6 +950,38 @@ export class BrowserCatalogService {
                 }
               } catch (e: any) {
                 attempts.push({ method: 'catalogModel._products', error: e?.message });
+              }
+            }
+
+            // Method B2: Check productCollCollection._index AFTER findCollectionsList
+            //   - findCollectionsList should have populated the store with collection models
+            //   - Each collection model might have products attached
+            if (products.length === 0 && productCollCollection?._index) {
+              try {
+                const idx = productCollCollection._index;
+                const idxKeys = Object.keys(idx);
+                const idxValues = Object.values(idx);
+                attempts.push({
+                  method: 'productCollCollection._index',
+                  indexSize: idxKeys.length,
+                  indexKeys: idxKeys.slice(0, 10),
+                });
+                // Check if any collection model in the index matches our colId
+                for (const cm of idxValues) {
+                  const cmAttrs = (cm as any)?.attributes || cm;
+                  if (String(cmAttrs?.id) === colId) {
+                    // Found the collection model — check if it has products
+                    const cmProducts = (cm as any)?.products || cmAttrs?.products;
+                    if (Array.isArray(cmProducts) && cmProducts.length > 0) {
+                      products = cmProducts.map(serializeProduct).filter(Boolean);
+                      method = 'productCollCollection._index';
+                      attempts[attempts.length - 1].matchedProducts = products.length;
+                      break;
+                    }
+                  }
+                }
+              } catch (e: any) {
+                attempts.push({ method: 'productCollCollection._index', error: e?.message });
               }
             }
 
