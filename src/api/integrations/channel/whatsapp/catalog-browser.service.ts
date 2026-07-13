@@ -114,7 +114,9 @@ export class BrowserCatalogService {
       products: any[];
       method: string;
       error?: string;
+      attempts?: any[];
     }>;
+    diagnostic?: any;
   }> {
     const svc = BrowserCatalogService.getInstance();
     if (!svc) {
@@ -768,7 +770,9 @@ export class BrowserCatalogService {
       products: any[];
       method: string;
       error?: string;
+      attempts?: any[];
     }>;
+    diagnostic?: any;
   }> {
     if (!this.config.enabled) {
       throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
@@ -817,59 +821,114 @@ export class BrowserCatalogService {
         const wa = wpp.whatsapp;
         if (!wa) return { results: [], error: 'WPP.whatsapp not available' };
 
+        // === Diagnostic: record what's actually available on WPP.whatsapp ===
+        const diag: any = {
+          waKeys: Object.keys(wa)
+            .filter((k) => /catalog|collection|product|wid/i.test(k))
+            .slice(0, 30),
+          hasWidFactory: !!wa.WidFactory,
+          hasCreateWid: typeof wa.WidFactory?.createWid === 'function',
+          hasCreateWidFromWidLike: typeof wa.WidFactory?.createWidFromWidLike === 'function',
+          hasProductCollCollection: !!wa.ProductCollCollection,
+          productCollCollectionMethods: wa.ProductCollCollection
+            ? Object.getOwnPropertyNames(wa.ProductCollCollection).concat(
+                Object.getOwnPropertyNames(Object.getPrototypeOf(wa.ProductCollCollection) || {}),
+              )
+            : [],
+          hasCatalogCollection: !!wa.CatalogCollection,
+          hasCatalogStore: !!wa.CatalogStore,
+          catalogStoreMethods: wa.CatalogStore
+            ? Object.getOwnPropertyNames(wa.CatalogStore).concat(
+                Object.getOwnPropertyNames(Object.getPrototypeOf(wa.CatalogStore) || {}),
+              )
+            : [],
+          hasCatalog: !!wpp.catalog,
+          catalogMethods: wpp.catalog ? Object.keys(wpp.catalog) : [],
+        };
+
+        // Helper: create a Wid object from any string (user JID or collection ID)
+        // Uses WidFactory if available (correct API); falls back to plain object
+        const makeWid = (id: string): any => {
+          try {
+            if (wa.WidFactory?.createWid) return wa.WidFactory.createWid(id);
+            if (wa.WidFactory?.createWidFromWidLike) return wa.WidFactory.createWidFromWidLike(id);
+          } catch (e: any) {
+            console.log(`makeWid(${id}) failed:`, e?.message);
+          }
+          return { _serialized: id, id, toString: () => id };
+        };
+
         // Helper: serialize WhatsApp model to plain object
         const serializeProduct = (p: any): any | null => {
-          if (!p?.id) return null;
+          if (!p) return null;
+          // Models have .attributes; raw objects are themselves
+          const attrs = p?.attributes || p;
+          if (!attrs?.id) return null;
           try {
-            return JSON.parse(JSON.stringify(p, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
+            return JSON.parse(JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
           } catch {
             return {
-              id: p.id,
-              name: p.name,
-              priceAmount1000: p.priceAmount1000,
-              currency: p.currency,
+              id: attrs.id,
+              name: attrs.name,
+              priceAmount1000: attrs.priceAmount1000,
+              currency: attrs.currency,
             };
           }
         };
+
+        // Track all method attempts for diagnostics
+        const attempts: any[] = [];
 
         // Helper: try multiple methods to get products for a collection
         const getProductsForCollection = async (
           collectionId: string,
           productLimit: number,
-        ): Promise<{ products: any[]; method: string; error?: string }> => {
-          // Method 1: ProductCollCollection.findCollectionProducts
-          //   - Same method web.whatsapp.com UI uses
-          //   - Signature: findCollectionProducts(collectionWid, limit)
+        ): Promise<{ products: any[]; method: string; error?: string; attempts: any[] }> => {
+          // Method 1: ProductCollCollection.findCollectionProducts(collectionWid, limit)
+          //   - Same method web.whatsapp.com UI uses when clicking a collection
+          //   - Returns ProductModel[] for that collection
           try {
             if (wa.ProductCollCollection?.findCollectionProducts) {
-              const wid = wa.createWid ? wa.createWid(collectionId) : { _serialized: collectionId, id: collectionId };
+              const wid = makeWid(collectionId);
+              attempts.push({ method: 'ProductCollCollection.findCollectionProducts', wid: String(wid) });
               const products: any[] = await wa.ProductCollCollection.findCollectionProducts(wid, productLimit);
+              attempts[attempts.length - 1].result = Array.isArray(products)
+                ? `${products.length} products`
+                : `non-array: ${typeof products}`;
               if (Array.isArray(products) && products.length > 0) {
                 return {
                   products: products.map(serializeProduct).filter(Boolean),
                   method: 'ProductCollCollection.findCollectionProducts',
+                  attempts,
                 };
               }
+            } else {
+              attempts.push({
+                method: 'ProductCollCollection.findCollectionProducts',
+                skipped: 'method not available',
+              });
             }
           } catch (e: any) {
-            console.log(`findCollectionProducts error for ${collectionId}:`, e?.message);
+            attempts.push({ method: 'ProductCollCollection.findCollectionProducts', error: e?.message });
           }
 
-          // Method 2: CollectionProductListRequest (GraphQL-style request)
-          //   - Android APK has CollectionProductListRequest class; web might
-          //     have similar via GraphQL module
-          //   - Try accessing through the catalog module
+          // Method 2: CatalogCollection.findCollectionMembership(catalogWid, productId, collectionWid?)
+          //   - Iterate ALL catalog products and check membership one-by-one
+          //   - Slow but works if catalog is already loaded in store
           try {
             if (wa.CatalogCollection?.findCollectionMembership) {
-              // This method checks if a product is in a collection. Slow but works.
-              const catalogWid = wa.createWid ? wa.createWid(userId) : { _serialized: userId, id: userId };
-              // Get all products from catalog store
+              const catalogWid = makeWid(userId);
               const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(catalogWid) : null;
+              attempts.push({
+                method: 'CatalogCollection.findCollectionMembership',
+                catalogModels: Array.isArray(catalogModels) ? catalogModels.length : 'n/a',
+              });
               if (Array.isArray(catalogModels) && catalogModels.length > 0) {
                 const catalogModel = catalogModels[0];
                 const allProducts = catalogModel?.productCollection?._index
                   ? Object.values(catalogModel.productCollection._index)
                   : [];
+                attempts[attempts.length - 1].totalCatalogProducts = allProducts.length;
                 const memberProducts: any[] = [];
                 for (const p of allProducts) {
                   if (memberProducts.length >= productLimit) break;
@@ -877,7 +936,19 @@ export class BrowserCatalogService {
                     const productModel = (p as any)?.attributes || p;
                     const productId = productModel?.id;
                     if (!productId) continue;
-                    const isMember = await wa.CatalogCollection.findCollectionMembership(catalogWid, productId);
+                    // findCollectionMembership may take (collectionWid, productId)
+                    // or (catalogWid, productId, collectionWid) — try both signatures
+                    const collectionWid = makeWid(collectionId);
+                    let isMember: any;
+                    try {
+                      isMember = await wa.CatalogCollection.findCollectionMembership(collectionWid, productId);
+                    } catch {
+                      isMember = await wa.CatalogCollection.findCollectionMembership(
+                        catalogWid,
+                        productId,
+                        collectionWid,
+                      );
+                    }
                     if (isMember) {
                       const plain = serializeProduct(productModel);
                       if (plain) memberProducts.push(plain);
@@ -886,28 +957,42 @@ export class BrowserCatalogService {
                     // skip individual product errors
                   }
                 }
+                attempts[attempts.length - 1].matchedProducts = memberProducts.length;
                 if (memberProducts.length > 0) {
                   return {
                     products: memberProducts,
                     method: 'CatalogCollection.findCollectionMembership',
+                    attempts,
                   };
                 }
               }
+            } else {
+              attempts.push({ method: 'CatalogCollection.findCollectionMembership', skipped: 'method not available' });
             }
           } catch (e: any) {
-            console.log(`findCollectionMembership error for ${collectionId}:`, e?.message);
+            attempts.push({ method: 'CatalogCollection.findCollectionMembership', error: e?.message });
           }
 
-          // Method 3: Scan CatalogStore products for collectionId field
-          //   - Some WhatsApp versions store collectionId on ProductModel
+          // Method 3: Scan CatalogStore.products for collection-related fields
+          //   - Some WhatsApp versions store collectionId on ProductModel attributes
           try {
-            const catalogWid = wa.createWid ? wa.createWid(userId) : { _serialized: userId, id: userId };
+            const catalogWid = makeWid(userId);
             const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(catalogWid) : null;
+            attempts.push({
+              method: 'CatalogStore.scanByCollectionId',
+              catalogModels: Array.isArray(catalogModels) ? catalogModels.length : 'n/a',
+            });
             if (Array.isArray(catalogModels) && catalogModels.length > 0) {
               const catalogModel = catalogModels[0];
               const allProducts = catalogModel?.productCollection?._index
                 ? Object.values(catalogModel.productCollection._index)
                 : [];
+              attempts[attempts.length - 1].totalCatalogProducts = allProducts.length;
+              // Sample product to see what fields exist
+              if (allProducts.length > 0) {
+                const sample = (allProducts[0] as any)?.attributes || allProducts[0];
+                attempts[attempts.length - 1].sampleProductKeys = Object.keys(sample).slice(0, 30);
+              }
               const matching = allProducts
                 .map((p: any) => p?.attributes || p)
                 .filter((p: any) => {
@@ -916,24 +1001,28 @@ export class BrowserCatalogService {
                     p?.collectionId === collectionId ||
                     p?.collection_id === collectionId ||
                     (Array.isArray(p?.collectionIds) && p.collectionIds.includes(collectionId)) ||
-                    (Array.isArray(p?.collection_ids) && p.collection_ids.includes(collectionId))
+                    (Array.isArray(p?.collection_ids) && p.collection_ids.includes(collectionId)) ||
+                    p?.collectionWid?._serialized === collectionId ||
+                    p?.collectionWid === collectionId
                   );
                 })
                 .map(serializeProduct)
                 .filter(Boolean)
                 .slice(0, productLimit);
+              attempts[attempts.length - 1].matchedProducts = matching.length;
               if (matching.length > 0) {
                 return {
                   products: matching,
                   method: 'CatalogStore.scanByCollectionId',
+                  attempts,
                 };
               }
             }
           } catch (e: any) {
-            console.log(`CatalogStore.scan error for ${collectionId}:`, e?.message);
+            attempts.push({ method: 'CatalogStore.scanByCollectionId', error: e?.message });
           }
 
-          return { products: [], method: 'none', error: 'All methods returned 0 products' };
+          return { products: [], method: 'none', error: 'All methods returned 0 products', attempts };
         };
 
         // Process each collection (sequentially to avoid rate limiting)
@@ -946,12 +1035,13 @@ export class BrowserCatalogService {
             products: r.products,
             method: r.method,
             error: r.error,
+            attempts: r.attempts,
           });
           // Small delay between collections
           await new Promise((res) => setTimeout(res, 300));
         }
 
-        return { results };
+        return { results, diag };
       },
       wppUserId,
       collectionIds,
@@ -962,9 +1052,13 @@ export class BrowserCatalogService {
       `[browser-fallback] Done. ${result?.results?.filter((r: any) => r.products?.length > 0).length || 0} ` +
         `collections have products, total: ${result?.results?.reduce((s: number, r: any) => s + (r.products?.length || 0), 0) || 0}`,
     );
+    if (result?.diag) {
+      this.logger.log(`[browser-fallback] Diagnostic: ${JSON.stringify(result.diag).slice(0, 500)}`);
+    }
 
     return {
       productsByCollectionId: result?.results || [],
+      diagnostic: result?.diag,
     };
   }
 

@@ -5114,6 +5114,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // when Baileys failed.
       let browserFallbackProducts = 0;
       const browserFallbackDebug: any[] = [];
+      let browserFallbackDiagnostic: any = undefined;
       if (totalBaileysProducts === 0 && (base.collections || []).length > 0) {
         this.logger.log(
           `[hybrid] Baileys returned 0 products — trying browser fallback ` +
@@ -5130,15 +5131,17 @@ export class BaileysStartupService extends ChannelStartupService {
               if (item?.collectionId && Array.isArray(item.products) && item.products.length > 0) {
                 productsByCollectionId.set(item.collectionId, item.products);
                 browserFallbackProducts += item.products.length;
-                browserFallbackDebug.push({
-                  collectionId: item.collectionId,
-                  collectionName: item.collectionName,
-                  productCount: item.products.length,
-                  method: item.method,
-                  error: item.error,
-                });
               }
+              browserFallbackDebug.push({
+                collectionId: item.collectionId,
+                collectionName: item.collectionName,
+                productCount: item.products?.length || 0,
+                method: item.method,
+                error: item.error,
+                attempts: item.attempts,
+              });
             }
+            browserFallbackDiagnostic = fallbackResult.diagnostic;
             this.logger.log(
               `[hybrid] Browser fallback got ${browserFallbackProducts} products across ` +
                 `${fallbackResult.productsByCollectionId.filter((i: any) => i.products?.length > 0).length} collections`,
@@ -5212,6 +5215,7 @@ export class BaileysStartupService extends ChannelStartupService {
         browserFallbackUsed: browserFallbackProducts > 0,
         browserFallbackProductsCount: browserFallbackProducts,
         browserFallbackDebug: browserFallbackDebug.length > 0 ? browserFallbackDebug : undefined,
+        browserFallbackDiagnostic,
         totalProductsMapped: finalTotalProducts,
       };
     }
