@@ -171,6 +171,108 @@ order, deduplicating products by ID:
 Uses `WPP.catalog.getCollections(userId)` with
 `CollectionStore.findQuery` fallback.
 
+> **⚠️ Known limitation**: wa-js `getCollections` returns **metadata only**
+> (`totalItemsCount: 0` for all collections) — it does NOT include the
+> products inside each collection. The wa-js wrapper doesn't expose the
+> nested `<product>` elements that WhatsApp's protocol returns.
+>
+> **Solution**: When `provider: "browser"` is used, `fetchCollections`
+> runs in **hybrid mode** — see [Hybrid Mode](#hybrid-mode) below.
+
+### Hybrid Mode
+
+When you call `getCollections` with `provider: "browser"`, the endpoint
+runs **both** paths in parallel and merges the results:
+
+| Path | Mechanism | Returns |
+|---|---|---|
+| **Browser (wa-js)** | Puppeteer + `WPP.catalog.getCollections(userId)` | Collection metadata only (id, name, status, totalItemsCount) |
+| **Baileys (protocol)** | IQ stanza `<collections biz_jid=... xmlns="w:biz:catalog">` with `collection_limit` and `item_limit` | Collections + nested products per collection |
+
+The Baileys path uses the **same open WhatsApp socket** that already
+powers the instance's messaging — no new connection needed. It sends
+the protocol-level IQ stanza directly:
+
+```xml
+<iq to="s.whatsapp.net" type="get" xmlns="w:biz:catalog" smax_id="35">
+  <collections biz_jid="{jid}">
+    <collection_limit>{limit}</collection_limit>
+    <item_limit>{limit}</item_limit>   <!-- ← KEY: requests products per collection -->
+    <width>100</width>
+    <height>100</height>
+  </collections>
+</iq>
+```
+
+WhatsApp responds with each `<collection>` containing nested `<product>`
+elements, which Baileys parses via `parseCollectionsNode()`:
+
+```json
+{
+  "collections": [
+    {
+      "id": "...",
+      "name": "Makanan",
+      "products": [
+        { "id": "prod_xxx", "name": "Nasi Goreng", "price": 25000, "currency": "IDR", ... },
+        ...
+      ],
+      "status": { "status": "APPROVED", "canAppeal": false }
+    }
+  ]
+}
+```
+
+#### Hybrid Response Shape
+
+```json
+{
+  "wuid": "6285733556953@s.whatsapp.net",
+  "name": null,
+  "numberExists": true,
+  "isBusiness": true,
+  "collectionsLength": 9,
+  "collections": [
+    {
+      "id": "...",
+      "name": "Makanan",
+      "products": [...],
+      "productsLength": 12,
+      "totalItemsCount": 12
+    }
+  ],
+  "source": "hybrid",
+  "baileysCollectionsCount": 9,
+  "baileysProductsCount": 95,
+  "baileysOk": true
+}
+```
+
+#### Why Hybrid Works
+
+- **`getCatalog` via Baileys fails** (anti-bot truncates result, returns
+  `isBusiness: false` and 0 products)
+- **`getCollections` via Baileys succeeds** (different IQ stanza —
+  WhatsApp server treats collection metadata queries more leniently)
+- **`getCatalog` via browser succeeds** (wa-js lazy-loads all pages via
+  `findNextProductPage()`, returns full 143-product catalog)
+- **`getCollections` via browser returns metadata only** (wa-js wrapper
+  limitation — no products in response)
+
+Hybrid = browser catalog (full products) + Baileys collections (with
+product mapping). Best of both worlds.
+
+#### Fallback Behavior
+
+If Baileys fails (e.g. anti-bot kicks in, or instance not yet business-verified),
+the response still succeeds but with:
+- `baileysOk: false`
+- `collections[].products: []` (empty arrays)
+- `baileysProductsCount: 0`
+
+Callers should check `baileysOk` and fall back to keyword matching or
+manual categorization if `false`.
+
 ### Resource Management
 
 - One `Browser` instance per JID, lazy-started on first request
@@ -258,4 +360,5 @@ Then call the endpoint again to get a fresh QR code.
 ---
 
 *Added in evolution-api v2.3.7-catalog-browser*
+*Hybrid collections (Baileys + browser) added in v2.3.8*
 *Branch: `feature/catalog-browser-provider`*

@@ -102,6 +102,24 @@ export interface BrowserCollectionsResult {
 }
 
 /**
+ * Result of the hybrid collections fetch (browser metadata + Baileys product mapping).
+ *
+ * Each collection's `products` array is populated from Baileys' protocol-level
+ * `getCollections` IQ stanza (which returns products nested in each collection).
+ * If Baileys fails (anti-bot / not-business), `products` arrays will be empty
+ * and `baileysOk` will be false — caller should fall back to keyword matching.
+ */
+export interface HybridCollectionsResult extends Omit<BrowserCollectionsResult, 'source'> {
+  source: 'hybrid';
+  /** Number of collections Baileys returned (may be 0 if anti-bot blocked it) */
+  baileysCollectionsCount: number;
+  /** Total number of products across all collections from Baileys */
+  baileysProductsCount: number;
+  /** Whether the Baileys protocol query succeeded */
+  baileysOk: boolean;
+}
+
+/**
  * Internal state of a browser session.
  */
 export interface BrowserSessionState {
