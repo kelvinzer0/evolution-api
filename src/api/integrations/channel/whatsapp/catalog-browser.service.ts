@@ -671,126 +671,46 @@ export class BrowserCatalogService {
       throw new BadRequestException('Could not determine WhatsApp user ID');
     }
 
-    // Step 1: Load ALL products via catalog pagination
-    this.logger.log('[browser] fetchCollections: loading catalog products...');
-    const allProducts: any[] = await page.evaluate(async (userId: string): Promise<any[]> => {
+    // Get collections metadata only (no product loading — too slow in page.evaluate)
+    // Products are fetched separately via getCatalog(browser) and mapped in n8n
+    // via keyword matching (auto-categorize).
+    const result = await page.evaluate(async (userId: string): Promise<any> => {
       const wpp = (window as any).WPP;
-      const wa = wpp.whatsapp;
-      const cats = await wa.CatalogStore.findQuery(userId);
-      const cat = cats[0];
-      if (!cat) return [];
-      for (let i = 0; i < 100; i++) {
-        const before = cat.productCollection?._index ? Object.keys(cat.productCollection._index).length : 0;
-        try { await wa.CatalogStore.findNextProductPage(cat.id); } catch { break; }
-        const after = cat.productCollection?._index ? Object.keys(cat.productCollection._index).length : 0;
-        if (after === before) break;
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      const idx = cat.productCollection?._index;
-      if (!idx) return [];
-      const products: any[] = [];
-      for (const pid of Object.keys(idx)) {
-        const p = idx[pid]?.attributes || idx[pid];
-        if (p) {
-          try {
-            const plain = JSON.parse(JSON.stringify(p, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
-            if (plain) products.push(plain);
-          } catch {}
-        }
-      }
-      return products;
-    }, wppUserId);
-    this.logger.log(`[browser] fetchCollections: ${allProducts.length} products loaded`);
+      if (!wpp) return { collections: [] };
 
-    // Step 2: Get collections (fast, separate evaluate)
-    const collectionData: any[] = await page.evaluate(async (userId: string): Promise<any[]> => {
-      const wpp = (window as any).WPP;
+      const collections: any[] = [];
+
       try {
         const cols = await wpp.catalog.getCollections(userId, 100, 50);
-        if (!Array.isArray(cols)) return [];
-        return cols.map((c: any) => {
-          const a = c?.attributes || c;
-          return { id: a?.id, name: a?.name, status: a?.reviewStatus || a?.status };
-        });
-      } catch { return []; }
-    }, wppUserId);
-    this.logger.log(`[browser] fetchCollections: ${collectionData.length} collections`);
-
-    // Step 3: Check membership in batches of 20 (avoids page.evaluate timeout)
-    const productToCollections: Record<string, string[]> = {};
-    const BATCH_SIZE = 20;
-
-    for (let i = 0; i < allProducts.length; i += BATCH_SIZE) {
-      const batch = allProducts.slice(i, i + BATCH_SIZE);
-      const batchProductIds = batch.map((p) => p.id);
-
-      const batchResult = await page.evaluate(
-        async (userId: string, productIds: string[]): Promise<Record<string, string[]>> => {
-          const wpp = (window as any).WPP;
-          const wa = wpp.whatsapp;
-          const result: Record<string, string[]> = {};
-          const cats = await wa.CatalogStore.findQuery(userId);
-          const cat = cats[0];
-          if (!cat) return result;
-          for (const pid of productIds) {
-            try {
-              const membership = await wa.CatalogStore.findCollectionMembership(cat.id, pid);
-              if (membership) {
-                const collList = Array.isArray(membership) ? membership : [membership];
-                const names: string[] = [];
-                for (const c of collList) {
-                  const a = c?.attributes || c;
-                  if (a?.name) names.push(a.name);
-                }
-                if (names.length > 0) result[pid] = names;
-              }
-            } catch {}
+        if (Array.isArray(cols)) {
+          for (const c of cols) {
+            const a = c?.attributes || c;
+            if (!a?.id) continue;
+            collections.push({
+              id: a.id,
+              name: a.name || '',
+              products: [],
+              status: a.reviewStatus || a.status,
+              totalItemsCount: a.totalItemsCount || 0,
+            });
           }
-          return result;
-        },
-        wppUserId,
-        batchProductIds,
-      );
+        }
+      } catch (error: any) {
+        console.log('getCollections error:', error?.message);
+      }
 
-      Object.assign(productToCollections, batchResult);
-      this.logger.log(
-        `[browser] fetchCollections: batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allProducts.length / BATCH_SIZE)} — ${Object.keys(batchResult).length} mapped`,
-      );
-    }
+      return { collections };
+    }, wppUserId);
 
-    this.logger.log(
-      `[browser] fetchCollections: ${Object.keys(productToCollections).length}/${allProducts.length} products mapped to collections`,
-    );
-
-    // Step 4: Build collections with products (in Node.js — no page.evaluate)
-    const collections = collectionData.map((col) => {
-      const colName = col.name || '';
-      const colProducts = allProducts
-        .filter((p) => {
-          const colls = productToCollections[p.id];
-          return colls && colls.includes(colName);
-        })
-        .map((p) => ({ ...p, _collectionName: colName }));
-
-      return {
-        id: col.id,
-        name: colName,
-        products: colProducts,
-        status: col.status,
-      };
-    });
-
-    this.logger.log(
-      `[browser] fetchCollections: ${collections.length} collections, ${collections.reduce((s, c) => s + c.products.length, 0)} total products in collections`,
-    );
+    this.logger.log(`[browser] fetchCollections: ${result.collections.length} collections`);
 
     return {
       wuid: options.jid,
       name: null,
       numberExists: true,
       isBusiness: true,
-      collectionsLength: collections.length,
-      collections,
+      collectionsLength: result.collections.length,
+      collections: result.collections,
       source: 'browser',
     };
   }
