@@ -660,10 +660,8 @@ export class BrowserCatalogService {
       throw new BadRequestException('WhatsApp Web page not available');
     }
 
-    // Ensure wa-js is injected (idempotent).
     await this.injectWaJs(page);
 
-    // Get the authenticated user's WhatsApp ID
     const wppUserId = await page.evaluate(() => {
       const wpp = (window as any).WPP;
       const myUser = wpp?.conn?.getMyUserId ? wpp.conn.getMyUserId() : null;
@@ -673,186 +671,117 @@ export class BrowserCatalogService {
       throw new BadRequestException('Could not determine WhatsApp user ID');
     }
 
-    const result = await page.evaluate(async (userId: string): Promise<any> => {
+    // Step 1: Load ALL products via catalog pagination
+    this.logger.log('[browser] fetchCollections: loading catalog products...');
+    const allProducts: any[] = await page.evaluate(async (userId: string): Promise<any[]> => {
       const wpp = (window as any).WPP;
-      if (!wpp) return { collections: [], message: 'WPP not available' };
-
-      const whatsappApi = wpp.whatsapp;
-
-      // Serialize helper
-      const serialize = (obj: any): any => {
-        if (!obj) return null;
-        try {
-          return JSON.parse(JSON.stringify(obj, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
-        } catch {
-          return { id: obj.id, name: obj.name };
-        }
-      };
-
-      // === Step 1: Get catalog model + load ALL products via pagination ===
-      // This is the stable path — getCatalog works reliably with findNextProductPage.
-      let catalogModel: any = null;
-      if (whatsappApi?.CatalogStore?.findQuery) {
-        try {
-          const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
-          if (Array.isArray(results) && results.length > 0) {
-            catalogModel = results[0];
-          }
-        } catch (error: any) {
-          console.log('CatalogStore.findQuery error:', error?.message);
-        }
+      const wa = wpp.whatsapp;
+      const cats = await wa.CatalogStore.findQuery(userId);
+      const cat = cats[0];
+      if (!cat) return [];
+      for (let i = 0; i < 100; i++) {
+        const before = cat.productCollection?._index ? Object.keys(cat.productCollection._index).length : 0;
+        try { await wa.CatalogStore.findNextProductPage(cat.id); } catch { break; }
+        const after = cat.productCollection?._index ? Object.keys(cat.productCollection._index).length : 0;
+        if (after === before) break;
+        await new Promise((r) => setTimeout(r, 500));
       }
-
-      // Load ALL products via findNextProductPage pagination
-      if (catalogModel && whatsappApi?.CatalogStore?.findNextProductPage) {
-        let pageCount = 0;
-        while (pageCount < 100) {
-          const beforeCount = catalogModel.productCollection?._index
-            ? Object.keys(catalogModel.productCollection._index).length
-            : 0;
+      const idx = cat.productCollection?._index;
+      if (!idx) return [];
+      const products: any[] = [];
+      for (const pid of Object.keys(idx)) {
+        const p = idx[pid]?.attributes || idx[pid];
+        if (p) {
           try {
-            await whatsappApi.CatalogStore.findNextProductPage(catalogModel.id);
-          } catch (e: any) {
-            break;
-          }
-          const afterCount = catalogModel.productCollection?._index
-            ? Object.keys(catalogModel.productCollection._index).length
-            : 0;
-          pageCount++;
-          if (afterCount === beforeCount) break;
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        console.log(`Catalog loaded: ${pageCount} pages`);
-      }
-
-      // Extract ALL products from catalog (serialized)
-      const allProducts: any[] = [];
-      if (catalogModel?.productCollection?._index) {
-        const productIndex = catalogModel.productCollection._index;
-        for (const pid of Object.keys(productIndex)) {
-          const p = productIndex[pid]?.attributes || productIndex[pid];
-          if (p) {
-            const plain = serialize(p);
-            if (plain) allProducts.push(plain);
-          }
+            const plain = JSON.parse(JSON.stringify(p, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
+            if (plain) products.push(plain);
+          } catch {}
         }
       }
-      console.log(`Total products from catalog: ${allProducts.length}`);
-
-      // === Step 2: Get collections ===
-      let collectionModels: any[] = [];
-      try {
-        collectionModels = await wpp.catalog.getCollections(userId, 100, 50);
-        if (!Array.isArray(collectionModels)) collectionModels = [];
-        console.log(`getCollections: ${collectionModels.length} collections`);
-      } catch (error: any) {
-        console.log('getCollections error:', error?.message);
-      }
-
-      // Build collection ID → name map
-      const collectionIdToName: Record<string, string> = {};
-      for (const col of collectionModels) {
-        const a = col?.attributes || col;
-        if (a?.id) collectionIdToName[a.id] = a.name || '';
-      }
-
-      // === Step 3: Build product → collection mapping via findCollectionMembership ===
-      // findCollectionMembership(catalogWid, productId) returns which collections
-      // a product belongs to. Call for each product to get the mapping.
-      const productToCollections: Record<string, string[]> = {};
-
-      if (catalogModel && allProducts.length > 0 && whatsappApi?.CatalogStore?.findCollectionMembership) {
-        console.log('Checking collection membership for each product...');
-        let checked = 0;
-        for (const product of allProducts) {
-          try {
-            // findCollectionMembership expects (catalogWid, productId)
-            // catalogWid is the catalog model's id (Wid object)
-            const membership = await whatsappApi.CatalogStore.findCollectionMembership(catalogModel.id, product.id);
-
-            if (membership) {
-              // membership could be: a single collection, array of collections, or a model
-              const collList = Array.isArray(membership) ? membership : [membership];
-              const collNames: string[] = [];
-              for (const c of collList) {
-                const cAttrs = c?.attributes || c;
-                const cId = cAttrs?.id;
-                if (cId && collectionIdToName[cId]) {
-                  collNames.push(collectionIdToName[cId]);
-                } else if (cAttrs?.name) {
-                  collNames.push(cAttrs.name);
-                }
-              }
-              if (collNames.length > 0) {
-                productToCollections[product.id] = collNames;
-              }
-            }
-            checked++;
-            if (checked % 20 === 0) console.log(`  Checked ${checked}/${allProducts.length}...`);
-          } catch (e: any) {
-            // Skip this product — membership check failed
-          }
-        }
-        console.log(`Membership checked: ${checked}, mapped: ${Object.keys(productToCollections).length}`);
-      }
-
-      // === Step 4: Build collections with products ===
-      const collections: any[] = [];
-
-      for (const colModel of collectionModels) {
-        const attrs = colModel?.attributes || colModel;
-        if (!attrs?.id) continue;
-
-        const colId = attrs.id;
-        const colName = attrs.name || '';
-
-        // Get products for this collection from the membership mapping
-        const colProducts: any[] = [];
-        for (const product of allProducts) {
-          const productColls = productToCollections[product.id];
-          if (productColls && productColls.includes(colName)) {
-            // Add collection name to product
-            const p = { ...product, _collectionName: colName };
-            colProducts.push(p);
-          }
-        }
-
-        // Also check if collection model itself has loaded products
-        if (colProducts.length === 0) {
-          const pIdx = colModel?.productCollection?._index;
-          if (pIdx && typeof pIdx === 'object') {
-            for (const pid of Object.keys(pIdx)) {
-              const p = pIdx[pid]?.attributes || pIdx[pid];
-              if (p) {
-                const plain = serialize(p);
-                if (plain) {
-                  plain._collectionName = colName;
-                  colProducts.push(plain);
-                }
-              }
-            }
-          }
-        }
-
-        console.log(`Collection "${colName}": ${colProducts.length} products`);
-
-        collections.push({
-          id: colId,
-          name: colName,
-          products: colProducts,
-          status: attrs.reviewStatus || attrs.status,
-        });
-      }
-
-      return {
-        collections,
-        totalProducts: allProducts.length,
-        mappedProducts: Object.keys(productToCollections).length,
-      };
+      return products;
     }, wppUserId);
+    this.logger.log(`[browser] fetchCollections: ${allProducts.length} products loaded`);
+
+    // Step 2: Get collections (fast, separate evaluate)
+    const collectionData: any[] = await page.evaluate(async (userId: string): Promise<any[]> => {
+      const wpp = (window as any).WPP;
+      try {
+        const cols = await wpp.catalog.getCollections(userId, 100, 50);
+        if (!Array.isArray(cols)) return [];
+        return cols.map((c: any) => {
+          const a = c?.attributes || c;
+          return { id: a?.id, name: a?.name, status: a?.reviewStatus || a?.status };
+        });
+      } catch { return []; }
+    }, wppUserId);
+    this.logger.log(`[browser] fetchCollections: ${collectionData.length} collections`);
+
+    // Step 3: Check membership in batches of 20 (avoids page.evaluate timeout)
+    const productToCollections: Record<string, string[]> = {};
+    const BATCH_SIZE = 20;
+
+    for (let i = 0; i < allProducts.length; i += BATCH_SIZE) {
+      const batch = allProducts.slice(i, i + BATCH_SIZE);
+      const batchProductIds = batch.map((p) => p.id);
+
+      const batchResult = await page.evaluate(
+        async (userId: string, productIds: string[]): Promise<Record<string, string[]>> => {
+          const wpp = (window as any).WPP;
+          const wa = wpp.whatsapp;
+          const result: Record<string, string[]> = {};
+          const cats = await wa.CatalogStore.findQuery(userId);
+          const cat = cats[0];
+          if (!cat) return result;
+          for (const pid of productIds) {
+            try {
+              const membership = await wa.CatalogStore.findCollectionMembership(cat.id, pid);
+              if (membership) {
+                const collList = Array.isArray(membership) ? membership : [membership];
+                const names: string[] = [];
+                for (const c of collList) {
+                  const a = c?.attributes || c;
+                  if (a?.name) names.push(a.name);
+                }
+                if (names.length > 0) result[pid] = names;
+              }
+            } catch {}
+          }
+          return result;
+        },
+        wppUserId,
+        batchProductIds,
+      );
+
+      Object.assign(productToCollections, batchResult);
+      this.logger.log(
+        `[browser] fetchCollections: batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allProducts.length / BATCH_SIZE)} — ${Object.keys(batchResult).length} mapped`,
+      );
+    }
 
     this.logger.log(
-      `[browser] fetchCollections got ${result.collections.length} collections, ${result.mappedProducts || 0}/${result.totalProducts || 0} products mapped`,
+      `[browser] fetchCollections: ${Object.keys(productToCollections).length}/${allProducts.length} products mapped to collections`,
+    );
+
+    // Step 4: Build collections with products (in Node.js — no page.evaluate)
+    const collections = collectionData.map((col) => {
+      const colName = col.name || '';
+      const colProducts = allProducts
+        .filter((p) => {
+          const colls = productToCollections[p.id];
+          return colls && colls.includes(colName);
+        })
+        .map((p) => ({ ...p, _collectionName: colName }));
+
+      return {
+        id: col.id,
+        name: colName,
+        products: colProducts,
+        status: col.status,
+      };
+    });
+
+    this.logger.log(
+      `[browser] fetchCollections: ${collections.length} collections, ${collections.reduce((s, c) => s + c.products.length, 0)} total products in collections`,
     );
 
     return {
@@ -860,19 +789,12 @@ export class BrowserCatalogService {
       name: null,
       numberExists: true,
       isBusiness: true,
-      collectionsLength: result.collections.length,
-      collections: result.collections,
+      collectionsLength: collections.length,
+      collections,
       source: 'browser',
     };
   }
 
-  /**
-   * Request a phone-number pairing code for an instance.
-   * Returns the 8-character code (e.g. "ABCD1234") that the user enters
-   * on their phone in WhatsApp → Linked Devices → Link with phone number instead.
-   *
-   * Phone format: international, digits only (e.g. "6285733556953" for Indonesia).
-   */
   async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {
     if (!this.config.enabled) {
       throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
