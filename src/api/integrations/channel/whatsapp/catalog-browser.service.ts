@@ -749,12 +749,10 @@ export class BrowserCatalogService {
           // Step 1: Get collection metadata via WPP.catalog.getCollections
           // This also populates CatalogStore and CatalogModel.collections
           const collections: any[] = [];
-          let rawCollectionModels: any[] = []; // Keep raw models for inspection
           try {
             // productsCount=colLimit — request up to colLimit products per collection
             const cols = await wpp.catalog.getCollections(userId, colLimit, colLimit);
             if (Array.isArray(cols)) {
-              rawCollectionModels = cols;
               // Diagnostic: dump ALL attributes of first collection model
               if (cols.length > 0) {
                 const firstCol = cols[0];
@@ -763,7 +761,13 @@ export class BrowserCatalogService {
                 diag.firstCollectionModelSample = {};
                 for (const k of Object.keys(firstAttrs).slice(0, 40)) {
                   const v = firstAttrs[k];
-                  if (v === null || v === undefined || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+                  if (
+                    v === null ||
+                    v === undefined ||
+                    typeof v === 'string' ||
+                    typeof v === 'number' ||
+                    typeof v === 'boolean'
+                  ) {
                     diag.firstCollectionModelSample[k] = v;
                   } else if (Array.isArray(v)) {
                     diag.firstCollectionModelSample[k] = `Array(${v.length})`;
