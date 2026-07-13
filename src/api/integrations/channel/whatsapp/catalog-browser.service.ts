@@ -23,7 +23,8 @@
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException } from '@exceptions';
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync } from 'fs';
+import axios from 'axios';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
@@ -816,10 +817,7 @@ export class BrowserCatalogService {
                   diag.firstEmbeddedProductKeys = firstProd
                     ? Object.keys(firstProd.attributes || firstProd).slice(0, 20)
                     : [];
-                  diag.firstEmbeddedProductHasId = !!(
-                    firstProd?.id ||
-                    firstProd?.attributes?.id
-                  );
+                  diag.firstEmbeddedProductHasId = !!(firstProd?.id || firstProd?.attributes?.id);
                   // Try serialize and check if it works
                   const testSerialized = serializeProduct(firstProd);
                   diag.firstEmbeddedProductSerializeResult = testSerialized
@@ -1199,12 +1197,130 @@ export class BrowserCatalogService {
       numberExists: true,
       isBusiness: true,
       collectionsLength: result.collections.length,
-      collections: result.collections,
+      collections: await this.downloadCollectionImages(result.collections, instanceName),
       source: 'browser',
       diagnostic: result.diag,
       perCollectionDebug: result.perCollectionDebug,
       totalProductsMapped: result.totalProducts || 0,
     };
+  }
+
+  /**
+   * Download product images from WhatsApp CDN to local storage.
+   *
+   * WhatsApp CDN URLs contain time-limited tokens (oh=, oe= parameters)
+   * that expire after ~24 hours. If n8n or other consumers try to download
+   * images later, they get 403 Forbidden.
+   *
+   * This method downloads images at fetch time and stores them in
+   * public/catalog-images/{instanceName}/{productId}.jpg
+   *
+   * The collections response replaces image_cdn_urls with local URLs
+   * like: http://evolution-api:8080/catalog-images/{instance}/{file}.jpg
+   *
+   * This ensures images are always accessible for Odoo sync.
+   */
+  private async downloadCollectionImages(collections: any[], instanceName: string): Promise<any[]> {
+    const imagesDir = join(process.cwd(), 'public', 'catalog-images', this.sanitizeClientId(instanceName));
+    mkdirSync(imagesDir, { recursive: true });
+
+    const baseUrl = process.env.SERVER_URL || `http://0.0.0.0:${process.env.PORT || 8080}`;
+    let downloadedCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+
+    for (const col of collections) {
+      if (!Array.isArray(col.products)) continue;
+
+      for (const product of col.products) {
+        const productId = String(product.id || '');
+        if (!productId) continue;
+
+        // Get the 'full' image URL (high-res, not thumbnail)
+        let imageUrl: string | null = null;
+        const cdnUrls = product.image_cdn_urls || [];
+        if (Array.isArray(cdnUrls)) {
+          // Prefer 'full' key, then 'original', then 'requested'
+          const sorted = [...cdnUrls].sort((a: any, b: any) => {
+            const priority = (k: string) => (k === 'full' ? 0 : k === 'original' ? 1 : k === 'requested' ? 3 : 2);
+            return priority(a?.key) - priority(b?.key);
+          });
+          for (const img of sorted) {
+            if (img?.value) {
+              imageUrl = img.value;
+              break;
+            }
+          }
+        }
+
+        if (!imageUrl) {
+          // No image URL — keep product as-is
+          skippedCount++;
+          continue;
+        }
+
+        // Local file path: {productId}.jpg
+        const localFile = `${productId}.jpg`;
+        const localPath = join(imagesDir, localFile);
+        const localUrl = `${baseUrl}/catalog-images/${this.sanitizeClientId(instanceName)}/${localFile}`;
+
+        // Check if already downloaded (skip re-download to save bandwidth)
+        try {
+          if (existsSync(localPath)) {
+            const stats = statSync(localPath);
+            if (stats.size > 1000) {
+              // File exists and is > 1KB — assume valid, skip download
+              product.image_cdn_urls = [{ key: 'local', value: localUrl }];
+              if (product.additional_image_cdn_urls?.[0]?.[0]) {
+                product.additional_image_cdn_urls = [];
+              }
+              skippedCount++;
+              continue;
+            }
+          }
+        } catch {
+          // stat failed — proceed with download
+        }
+
+        // Download image
+        try {
+          const response = await axios.get(imageUrl, {
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            maxRedirects: 5,
+          });
+
+          const buffer = Buffer.from(response.data);
+          if (buffer.length < 100) {
+            // Too small — probably error page
+            failedCount++;
+            continue;
+          }
+
+          // Write to file
+          writeFileSync(localPath, buffer);
+
+          // Replace CDN URLs with local URL
+          product.image_cdn_urls = [{ key: 'local', value: localUrl }];
+          // Clear additional images (they'd need separate download logic)
+          if (product.additional_image_cdn_urls) {
+            product.additional_image_cdn_urls = [];
+          }
+
+          downloadedCount++;
+        } catch (err) {
+          this.logger.warn(`[browser] Failed to download image for product ${productId}: ${(err as Error)?.message}`);
+          failedCount++;
+          // Keep original CDN URL as fallback
+        }
+      }
+    }
+
+    this.logger.log(
+      `[browser] Image download: ${downloadedCount} downloaded, ${skippedCount} cached, ${failedCount} failed`,
+    );
+
+    return collections;
   }
 
   async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {
