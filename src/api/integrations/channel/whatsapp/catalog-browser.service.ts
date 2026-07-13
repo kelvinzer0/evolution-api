@@ -31,7 +31,6 @@ import {
   BrowserCatalogConfig,
   BrowserCatalogOptions,
   BrowserCatalogResult,
-  BrowserCollection,
   BrowserCollectionsOptions,
   BrowserCollectionsResult,
 } from './catalog-browser.types';
