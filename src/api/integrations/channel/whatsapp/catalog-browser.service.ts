@@ -683,35 +683,127 @@ export class BrowserCatalogService {
         const wpp = (window as any).WPP;
         if (!wpp) return { collections: [], message: 'WPP not available' };
 
+        const whatsappApi = wpp.whatsapp;
         const collections: BrowserCollection[] = [];
 
-        // Use wa-js public API: WPP.catalog.getCollections(chatId, qnt, productsCount)
-        if (wpp.catalog?.getCollections) {
+        // Serialize helper (same as catalog fetch)
+        const serialize = (obj: any): any => {
+          if (!obj) return null;
           try {
-            const response: any[] = await wpp.catalog.getCollections(userId, 100, 50);
-            if (Array.isArray(response)) {
-              for (const c of response) {
-                const attrs = c?.attributes || c;
-                if (!attrs?.id) continue;
-                const productIndex = c?.productCollection?._index;
-                const products: any[] = [];
-                if (productIndex && typeof productIndex === 'object') {
-                  for (const pid of Object.keys(productIndex)) {
-                    const p = productIndex[pid]?.attributes || productIndex[pid];
-                    if (p) products.push(p);
-                  }
-                }
-                collections.push({
-                  id: attrs.id,
-                  name: attrs.name || '',
-                  products,
-                  status: attrs.status,
-                });
-              }
+            return JSON.parse(JSON.stringify(obj, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
+          } catch {
+            return { id: obj.id, name: obj.name };
+          }
+        };
+
+        // Step 1: Get catalog model to access collections
+        let catalogModel: any = null;
+        if (whatsappApi?.CatalogStore?.findQuery) {
+          try {
+            const results: any[] = await whatsappApi.CatalogStore.findQuery(userId);
+            if (Array.isArray(results) && results.length > 0) {
+              catalogModel = results[0];
             }
           } catch (error: any) {
-            console.log('WPP.catalog.getCollections error:', error?.message);
+            console.log('CatalogStore.findQuery error:', error?.message);
           }
+        }
+
+        // Step 2: Get collections via WPP.catalog.getCollections
+        let collectionModels: any[] = [];
+        try {
+          collectionModels = await wpp.catalog.getCollections(userId, 100, 50);
+          if (!Array.isArray(collectionModels)) collectionModels = [];
+          console.log(`getCollections: ${collectionModels.length} collections`);
+        } catch (error: any) {
+          console.log('getCollections error:', error?.message);
+        }
+
+        // Step 3: For each collection, load products
+        // Collections are lazy-loaded like catalog — need to fetch products
+        // Use findCollectionProducts if available, or read from productCollection._index
+        for (const colModel of collectionModels) {
+          const attrs = colModel?.attributes || colModel;
+          if (!attrs?.id) continue;
+
+          const colId = attrs.id;
+          const colName = attrs.name || '';
+          const totalItems = attrs.totalItemsCount || 0;
+          console.log(`Collection: ${colName} (totalItems=${totalItems})`);
+
+          // Try to load products from collection model's productCollection
+          let products: any[] = [];
+          const productIndex = colModel?.productCollection?._index;
+          if (productIndex && typeof productIndex === 'object') {
+            for (const pid of Object.keys(productIndex)) {
+              const p = productIndex[pid]?.attributes || productIndex[pid];
+              if (p) {
+                const plain = serialize(p);
+                if (plain) products.push(plain);
+              }
+            }
+          }
+          console.log(`  Products from store: ${products.length}`);
+
+          // If products count < totalItems, try to load more via findCollectionProducts
+          if (products.length < totalItems && whatsappApi?.CatalogStore?.findCollectionProducts) {
+            try {
+              // findCollectionProducts(collectionId, count) — fetches products from server
+              await whatsappApi.CatalogStore.findCollectionProducts(colId, totalItems);
+
+              // Re-read products after loading
+              const newIndex = colModel?.productCollection?._index;
+              if (newIndex && typeof newIndex === 'object') {
+                products = [];
+                for (const pid of Object.keys(newIndex)) {
+                  const p = newIndex[pid]?.attributes || newIndex[pid];
+                  if (p) {
+                    const plain = serialize(p);
+                    if (plain) products.push(plain);
+                  }
+                }
+              }
+              console.log(`  Products after findCollectionProducts: ${products.length}`);
+            } catch (error: any) {
+              console.log(`  findCollectionProducts error: ${error?.message}`);
+            }
+          }
+
+          // Also try catalogModel.collections for product mapping
+          // (CatalogModel has a 'collections' property that links products to collections)
+          if (products.length === 0 && catalogModel?.collections) {
+            try {
+              const collData = catalogModel.collections;
+              // collections might be a Collection with _index
+              const collIndex = collData?._index || collData;
+              if (collIndex && typeof collIndex === 'object') {
+                for (const cid of Object.keys(collIndex)) {
+                  const c = collIndex[cid];
+                  if (c?.id === colId || c?.attributes?.id === colId) {
+                    const colProducts = c?.productCollection?._index;
+                    if (colProducts && typeof colProducts === 'object') {
+                      for (const pid of Object.keys(colProducts)) {
+                        const p = colProducts[pid]?.attributes || colProducts[pid];
+                        if (p) {
+                          const plain = serialize(p);
+                          if (plain) products.push(plain);
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (error: any) {
+              console.log(`  catalogModel.collections lookup error: ${error?.message}`);
+            }
+          }
+
+          collections.push({
+            id: colId,
+            name: colName,
+            products,
+            status: attrs.reviewStatus || attrs.status,
+          });
         }
 
         return { collections };
