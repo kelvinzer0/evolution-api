@@ -1137,11 +1137,23 @@ export class BrowserCatalogService {
           }
 
           // Attach products to collections
+          // IMPORTANT: Only overwrite if the collection doesn't already have
+          // embedded products from Step 1 (getCollections response). The
+          // productsByCollectionId Map is populated by Methods A/B/C which
+          // all failed — so it's empty. Overwriting would destroy the
+          // embedded products that were already correctly set in Step 1.
           for (const col of collections) {
-            const prods = productsByCollectionId.get(col.id) || [];
-            col.products = prods;
-            col.productsLength = prods.length;
-            col.totalItemsCount = prods.length;
+            if (Array.isArray(col.products) && col.products.length > 0) {
+              // Already has embedded products — don't overwrite, just update counts
+              col.productsLength = col.products.length;
+              col.totalItemsCount = col.products.length;
+            } else {
+              // No embedded products — use productsByCollectionId (may also be empty)
+              const prods = productsByCollectionId.get(col.id) || [];
+              col.products = prods;
+              col.productsLength = prods.length;
+              col.totalItemsCount = prods.length;
+            }
           }
 
           const totalProducts = collections.reduce(
