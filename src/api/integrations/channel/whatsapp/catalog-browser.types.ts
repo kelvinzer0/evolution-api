@@ -99,6 +99,18 @@ export interface BrowserCollectionsResult {
   collectionsLength: number;
   collections: BrowserCollection[];
   source: 'browser';
+  /** Diagnostic info about wa-js webpack modules available */
+  diagnostic?: any;
+  /** Per-collection debug info: which method worked, product count, attempts */
+  perCollectionDebug?: Array<{
+    collectionId: string;
+    collectionName?: string;
+    productCount: number;
+    method: string;
+    attempts?: any[];
+  }>;
+  /** Total products mapped across all collections */
+  totalProductsMapped?: number;
 }
 
 /**

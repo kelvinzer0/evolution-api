@@ -154,7 +154,6 @@ import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BrowserCatalogService } from './catalog-browser.service';
-import type { BrowserCollectionsResult } from './catalog-browser.types';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -5003,223 +5002,30 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async fetchCollections(instanceName: string, data: getCollectionsDto) {
-    // === Provider routing: hybrid mode (browser metadata + Baileys product mapping) ===
+    // === Provider routing: pure browser (wa-js) ===
     //
-    // Why hybrid:
-    //   - whatsapp-web.js (wa-js) `getCollections` returns metadata only
-    //     (totalItemsCount: 0 for all collections) — wa-js wrapper doesn't
-    //     expose the nested products array.
-    //   - Baileys' protocol-level `getCollections` (IQ stanza with
-    //     `item_limit`) DOES return products nested in each collection,
-    //     but can't fetch the full catalog (truncated by anti-bot).
-    //   - Hybrid = best of both: browser for the heavy catalog fetch,
-    //     Baileys protocol for the lightweight collection→product mapping.
+    // User instruction: "jangan hybrid, full research dari wa-js"
+    // Drop the Baileys protocol path entirely. Use wa-js (web.whatsapp.com
+    // webpack modules) for BOTH metadata AND product→collection mapping.
     //
-    // The Baileys path is soft-failed — if anti-bot blocks it, we still
-    // return the browser metadata (same behavior as before).
+    // Architecture (mirrors getCatalog's store-based approach):
+    //   1. WPP.catalog.getCollections(userId, limit, productsCount) → metadata
+    //   2. CatalogStore.findQuery(userId) → CatalogModel
+    //   3. catalogModel.collections → ProductCollCollection instance
+    //   4. collections.findCollectionProducts(collectionId, limit) → products
+    //   5. Fallback: CatalogStore.findCollectionMembership per product
+    //
+    // This is the same pattern that made getCatalog work (findNextProductPage
+    // loop on CatalogStore). Now applied to collections.
     if (data.provider === 'browser') {
       const jid = data.number ? createJid(data.number) : this.client?.user?.id;
-      const limit = Number(data.limit) || 100;
-
-      // Time the Baileys call for diagnostics
-      const baileysStart = Date.now();
-
-      // Fire both requests in parallel — they hit different code paths
-      // (browser automates web.whatsapp.com; Baileys sends IQ stanza
-      // through the open WhatsApp socket on this Evolution API instance).
-      const [browserSettled, baileysSettled] = await Promise.allSettled([
-        BrowserCatalogService.fetchCollectionsOrThrow({ jid, instanceName, limit }),
-        (async () => {
-          // Use the same Baileys socket that powers this instance.
-          // We call the low-level getCollections directly to bypass the
-          // fetchCollections wrapper's isBusiness gate (which would block
-          // us if fetchBusinessProfile reports isBusiness=false).
-          try {
-            const result = await this.getCollections(jid, limit);
-            const durationMs = Date.now() - baileysStart;
-            // Detailed logging — what did Baileys actually return?
-            const rawLen = Array.isArray(result) ? result.length : -1;
-            const validCols = Array.isArray(result) ? result.filter((c: any) => c?.id) : [];
-            const totalProds = validCols.reduce(
-              (sum: number, c: any) => sum + (Array.isArray(c?.products) ? c.products.length : 0),
-              0,
-            );
-            this.logger.log(
-              `[hybrid] Baileys getCollections(jid=${jid}, limit=${limit}) returned ` +
-                `array.length=${rawLen}, valid=${validCols.length}, totalProducts=${totalProds} ` +
-                `in ${durationMs}ms`,
-            );
-            if (validCols.length > 0) {
-              // Log sample collection for debugging
-              const sample = validCols[0];
-              this.logger.log(
-                `[hybrid] Sample Baileys collection: id=${sample.id}, name=${(sample as any).name}, ` +
-                  `products.length=${(sample as any).products?.length || 0}`,
-              );
-            } else if (rawLen > 0) {
-              // Array returned but no valid collections — log structure
-              this.logger.warn(
-                `[hybrid] Baileys returned ${rawLen} items but none had valid id. ` +
-                  `First item: ${JSON.stringify(result?.[0])?.slice(0, 200)}`,
-              );
-            }
-            return result;
-          } catch (err) {
-            const durationMs = Date.now() - baileysStart;
-            this.logger.warn(
-              `[hybrid] Baileys getCollections failed after ${durationMs}ms: ` +
-                `${(err as Error)?.message || err}. ` +
-                `Falling back to browser-only metadata (no product mapping).`,
-            );
-            return null;
-          }
-        })(),
-      ]);
-
-      // If browser failed entirely, surface that error.
-      if (browserSettled.status === 'rejected') {
-        throw browserSettled.reason;
-      }
-      const base = browserSettled.value as BrowserCollectionsResult;
-      const baileysCollections =
-        baileysSettled.status === 'fulfilled' ? (baileysSettled.value as CatalogCollection[] | null) : null;
-
-      // Build collection id → products map from Baileys (source of truth
-      // for product→collection mapping).
-      const productsByCollectionId = new Map<string, any[]>();
-      let totalBaileysProducts = 0;
-      let baileysValidCollections = 0;
-      if (baileysCollections && Array.isArray(baileysCollections)) {
-        for (const col of baileysCollections) {
-          if (col?.id && Array.isArray((col as any).products)) {
-            productsByCollectionId.set(col.id, (col as any).products as any[]);
-            totalBaileysProducts += ((col as any).products as any[]).length;
-            baileysValidCollections++;
-          }
-        }
-      }
-
-      // === Browser cross-reference fallback ===
-      //
-      // If Baileys returned 0 products (e.g. anti-bot blocked, or instance
-      // not fully business-verified for protocol queries), try fetching
-      // products per collection directly via wa-js's webpack modules.
-      //
-      // Method: WPP.whatsapp.ProductCollCollection.findCollectionProducts(collectionId, limit)
-      //   — this is the same method web.whatsapp.com's UI uses when you
-      //     click on a collection to see its products.
-      //   — returns ProductModel[] which we serialize and attach.
-      //
-      // This is slow (one round-trip per collection), so only triggered
-      // when Baileys failed.
-      let browserFallbackProducts = 0;
-      const browserFallbackDebug: any[] = [];
-      let browserFallbackDiagnostic: any = undefined;
-      if (totalBaileysProducts === 0 && (base.collections || []).length > 0) {
-        this.logger.log(
-          `[hybrid] Baileys returned 0 products — trying browser fallback ` +
-            `(WPP.whatsapp.ProductCollCollection.findCollectionProducts) for ${base.collections.length} collections`,
-        );
-        try {
-          const fallbackResult = await BrowserCatalogService.fetchCollectionProductsFallback({
-            instanceName,
-            collectionIds: (base.collections || []).map((c: any) => ({ id: c.id, name: c.name })),
-            productsPerCollection: limit,
-          });
-          if (fallbackResult && Array.isArray(fallbackResult.productsByCollectionId)) {
-            for (const item of fallbackResult.productsByCollectionId) {
-              if (item?.collectionId && Array.isArray(item.products) && item.products.length > 0) {
-                productsByCollectionId.set(item.collectionId, item.products);
-                browserFallbackProducts += item.products.length;
-              }
-              browserFallbackDebug.push({
-                collectionId: item.collectionId,
-                collectionName: item.collectionName,
-                productCount: item.products?.length || 0,
-                method: item.method,
-                error: item.error,
-                attempts: item.attempts,
-              });
-            }
-            browserFallbackDiagnostic = fallbackResult.diagnostic;
-            this.logger.log(
-              `[hybrid] Browser fallback got ${browserFallbackProducts} products across ` +
-                `${fallbackResult.productsByCollectionId.filter((i: any) => i.products?.length > 0).length} collections`,
-            );
-          }
-        } catch (err) {
-          this.logger.warn(
-            `[hybrid] Browser fallback failed: ${(err as Error)?.message || err}. ` +
-              `Continuing with browser-only metadata.`,
-          );
-        }
-      }
-
-      // Merge: enrich browser collections with Baileys (or browser fallback) product arrays.
-      const mergedCollections = (base.collections || []).map((c: any) => {
-        const products = productsByCollectionId.get(c.id) || [];
-        return {
-          ...c,
-          products,
-          productsLength: products.length,
-          // Prefer browser's totalItemsCount when present; fall back to
-          // the actual count of products we got.
-          totalItemsCount: c.totalItemsCount || products.length,
-          mappingSource:
-            baileysValidCollections > 0 && productsByCollectionId.has(c.id)
-              ? 'baileys'
-              : browserFallbackProducts > 0 && productsByCollectionId.has(c.id)
-                ? 'browser-fallback'
-                : 'none',
-        };
+      return BrowserCatalogService.fetchCollectionsOrThrow({
+        jid,
+        instanceName,
+        limit: Number(data.limit) || 100,
       });
-
-      // Also include any Baileys-only collections not surfaced by wa-js
-      // (rare, but happens if wa-js pagination is inconsistent).
-      const browserIds = new Set(mergedCollections.map((c: any) => c.id));
-      if (baileysCollections) {
-        for (const col of baileysCollections) {
-          if (col?.id && !browserIds.has(col.id)) {
-            const prods = (col as any).products || [];
-            mergedCollections.push({
-              id: col.id,
-              name: (col as any).name || '',
-              products: prods,
-              productsLength: prods.length,
-              status: (col as any).status,
-              totalItemsCount: prods.length,
-              source: 'baileys-only',
-              mappingSource: 'baileys',
-            });
-          }
-        }
-      }
-
-      const finalTotalProducts = mergedCollections.reduce(
-        (sum: number, c: any) => sum + (Array.isArray(c.products) ? c.products.length : 0),
-        0,
-      );
-
-      return {
-        wuid: base.wuid,
-        name: base.name,
-        numberExists: base.numberExists,
-        isBusiness: base.isBusiness,
-        collectionsLength: mergedCollections.length,
-        collections: mergedCollections,
-        source: 'hybrid',
-        // Diagnostics
-        baileysCollectionsCount: baileysValidCollections,
-        baileysProductsCount: totalBaileysProducts,
-        baileysOk: !!baileysCollections,
-        browserFallbackUsed: browserFallbackProducts > 0,
-        browserFallbackProductsCount: browserFallbackProducts,
-        browserFallbackDebug: browserFallbackDebug.length > 0 ? browserFallbackDebug : undefined,
-        browserFallbackDiagnostic,
-        totalProductsMapped: finalTotalProducts,
-      };
     }
-    // === End hybrid routing ===
+    // === End browser routing ===
 
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = Number(data.limit) || 100;

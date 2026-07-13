@@ -99,34 +99,6 @@ export class BrowserCatalogService {
     return svc.fetchCollections(options);
   }
 
-  /**
-   * Static wrapper for fetchCollectionProductsFallback.
-   * Called by whatsapp.baileys.service.ts when Baileys returns 0 products.
-   */
-  static async fetchCollectionProductsFallback(options: {
-    instanceName: string;
-    collectionIds: Array<{ id: string; name?: string }>;
-    productsPerCollection: number;
-  }): Promise<{
-    productsByCollectionId: Array<{
-      collectionId: string;
-      collectionName?: string;
-      products: any[];
-      method: string;
-      error?: string;
-      attempts?: any[];
-    }>;
-    diagnostic?: any;
-  }> {
-    const svc = BrowserCatalogService.getInstance();
-    if (!svc) {
-      throw new BadRequestException(
-        'Browser catalog service is not initialized. Set CATALOG_BROWSER_ENABLED=true to enable.',
-      );
-    }
-    return svc.fetchCollectionProductsFallback(options);
-  }
-
   private loadConfig(): BrowserCatalogConfig {
     const enabled = (process.env.CATALOG_BROWSER_ENABLED || 'false').toLowerCase() === 'true';
     const idleTimeoutMs = parseInt(process.env.CATALOG_BROWSER_IDLE_TIMEOUT_MS || '600000', 10);
@@ -698,156 +670,32 @@ export class BrowserCatalogService {
       throw new BadRequestException('Could not determine WhatsApp user ID');
     }
 
-    // Get collections metadata only (no product loading — too slow in page.evaluate)
-    // Products are fetched separately via getCatalog(browser) and mapped in n8n
-    // via keyword matching (auto-categorize).
-    const result = await page.evaluate(async (userId: string): Promise<any> => {
-      const wpp = (window as any).WPP;
-      if (!wpp) return { collections: [] };
-
-      const collections: any[] = [];
-
-      try {
-        const cols = await wpp.catalog.getCollections(userId, 100, 50);
-        if (Array.isArray(cols)) {
-          for (const c of cols) {
-            const a = c?.attributes || c;
-            if (!a?.id) continue;
-            collections.push({
-              id: a.id,
-              name: a.name || '',
-              products: [],
-              status: a.reviewStatus || a.status,
-              totalItemsCount: a.totalItemsCount || 0,
-            });
-          }
-        }
-      } catch (error: any) {
-        console.log('getCollections error:', error?.message);
-      }
-
-      return { collections };
-    }, wppUserId);
-
-    this.logger.log(`[browser] fetchCollections: ${result.collections.length} collections`);
-
-    return {
-      wuid: options.jid,
-      name: null,
-      numberExists: true,
-      isBusiness: true,
-      collectionsLength: result.collections.length,
-      collections: result.collections,
-      source: 'browser',
-    };
-  }
-
-  /**
-   * Browser fallback: fetch products per collection via wa-js webpack modules.
-   *
-   * This is called when Baileys' protocol-level getCollections returns 0
-   * products (e.g. anti-bot blocked, or instance not fully business-verified).
-   *
-   * Strategy (tries multiple methods in order):
-   *   1. WPP.whatsapp.ProductCollCollection.findCollectionProducts(collectionId, limit)
-   *      — same method web.whatsapp.com's UI uses when you click a collection
-   *   2. WPP.whatsapp.CatalogCollection.findCollectionMembership(catalogWid, productId)
-   *      — alternative: check membership for each known product (slower)
-   *   3. Iterate CatalogStore.productCollection._index and filter by collectionId
-   *      — last resort: scan all cached products (works only if catalog was
-   *        already fetched via getCatalog before this call)
-   *
-   * Returns one entry per input collection (even if 0 products or error).
-   */
-  async fetchCollectionProductsFallback(options: {
-    instanceName: string;
-    collectionIds: Array<{ id: string; name?: string }>;
-    productsPerCollection: number;
-  }): Promise<{
-    productsByCollectionId: Array<{
-      collectionId: string;
-      collectionName?: string;
-      products: any[];
-      method: string;
-      error?: string;
-      attempts?: any[];
-    }>;
-    diagnostic?: any;
-  }> {
-    if (!this.config.enabled) {
-      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
-    }
-
-    const { instanceName, collectionIds, productsPerCollection } = options;
-    this.logger.log(
-      `[browser-fallback] Fetching products for ${collectionIds.length} collections ` +
-        `(productsPerCollection=${productsPerCollection})`,
-    );
-
-    let state: InstanceClientState;
-    try {
-      state = await this.getReadyClient(instanceName);
-    } catch (err) {
-      throw new BadRequestException(`Browser client not ready: ${(err as Error)?.message}`);
-    }
-
-    if (!state.ready || state.qrCode) {
-      throw new BadRequestException('Browser session not authenticated. Scan QR code first.');
-    }
-
-    const page = await state.client.pupPage;
-    if (!page) {
-      throw new BadRequestException('WhatsApp Web page not available');
-    }
-
-    await this.injectWaJs(page);
-
-    const wppUserId = await page.evaluate(() => {
-      const wpp = (window as any).WPP;
-      const myUser = wpp?.conn?.getMyUserId ? wpp.conn.getMyUserId() : null;
-      return myUser ? myUser._serialized : null;
-    });
-    if (!wppUserId) {
-      throw new BadRequestException('Could not determine WhatsApp user ID');
-    }
-
-    // Execute fallback strategy in page context.
-    // We pass the list of collection IDs and let the page code try each method.
+    // === Pure wa-js collection fetch with product mapping ===
+    //
+    // Architecture (mirrors getCatalog's store-based approach):
+    //   1. WPP.catalog.getCollections(userId, limit, productsCount) → metadata
+    //      This sends IQ stanza via queryCollectionsIQ and populates:
+    //        - CatalogStore with collection metadata
+    //        - CatalogModel.collections with ProductCollCollection instance
+    //   2. CatalogStore.findQuery(userId) → CatalogModel
+    //   3. catalogModel.collections → ProductCollCollection instance
+    //   4. For each collection:
+    //      a. collections.findCollectionProducts(collectionId, limit) → products
+    //      b. Fallback: CatalogStore.findCollectionMembership(productId) per product
+    //      c. Fallback: scan catalogModel.productCollection._index for collectionId field
+    //
+    // This is the same pattern that made getCatalog work (findNextProductPage
+    // loop on CatalogStore). Now applied to collections.
+    const limit = options.limit || 100;
     const result = await page.evaluate(
-      async (userId: string, collections: Array<{ id: string; name?: string }>, limit: number): Promise<any> => {
+      async (userId: string, colLimit: number): Promise<any> => {
         const wpp = (window as any).WPP;
-        if (!wpp) return { results: [], error: 'WPP not available' };
+        if (!wpp) return { collections: [], error: 'WPP not available' };
 
         const wa = wpp.whatsapp;
-        if (!wa) return { results: [], error: 'WPP.whatsapp not available' };
+        if (!wa) return { collections: [], error: 'WPP.whatsapp not available' };
 
-        // === Diagnostic: record what's actually available on WPP.whatsapp ===
-        const diag: any = {
-          waKeys: Object.keys(wa)
-            .filter((k) => /catalog|collection|product|wid/i.test(k))
-            .slice(0, 30),
-          hasWidFactory: !!wa.WidFactory,
-          hasCreateWid: typeof wa.WidFactory?.createWid === 'function',
-          hasCreateWidFromWidLike: typeof wa.WidFactory?.createWidFromWidLike === 'function',
-          hasProductCollCollection: !!wa.ProductCollCollection,
-          productCollCollectionMethods: wa.ProductCollCollection
-            ? Object.getOwnPropertyNames(wa.ProductCollCollection).concat(
-                Object.getOwnPropertyNames(Object.getPrototypeOf(wa.ProductCollCollection) || {}),
-              )
-            : [],
-          hasCatalogCollection: !!wa.CatalogCollection,
-          hasCatalogStore: !!wa.CatalogStore,
-          catalogStoreMethods: wa.CatalogStore
-            ? Object.getOwnPropertyNames(wa.CatalogStore).concat(
-                Object.getOwnPropertyNames(Object.getPrototypeOf(wa.CatalogStore) || {}),
-              )
-            : [],
-          hasCatalog: !!wpp.catalog,
-          catalogMethods: wpp.catalog ? Object.keys(wpp.catalog) : [],
-        };
-
-        // Helper: create a Wid object from any string (user JID or collection ID)
-        // Uses WidFactory if available (correct API); falls back to plain object
+        // Helper: create Wid from string
         const makeWid = (id: string): any => {
           try {
             if (wa.WidFactory?.createWid) return wa.WidFactory.createWid(id);
@@ -861,11 +709,12 @@ export class BrowserCatalogService {
         // Helper: serialize WhatsApp model to plain object
         const serializeProduct = (p: any): any | null => {
           if (!p) return null;
-          // Models have .attributes; raw objects are themselves
           const attrs = p?.attributes || p;
           if (!attrs?.id) return null;
           try {
-            return JSON.parse(JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
+            return JSON.parse(
+              JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+            );
           } catch {
             return {
               id: attrs.id,
@@ -876,191 +725,281 @@ export class BrowserCatalogService {
           }
         };
 
-        // Track all method attempts for diagnostics
-        const attempts: any[] = [];
+        // Diagnostic info
+        const diag: any = {
+          catalogStoreExists: !!wa.CatalogStore,
+          catalogStoreMethods: wa.CatalogStore
+            ? Object.getOwnPropertyNames(Object.getPrototypeOf(wa.CatalogStore) || {})
+                .concat(Object.getOwnPropertyNames(wa.CatalogStore))
+                .filter((m: string) => typeof wa.CatalogStore[m] === 'function' && !m.startsWith('_'))
+            : [],
+          productCollCollectionExists: !!wa.ProductCollCollection,
+        };
 
-        // Helper: try multiple methods to get products for a collection
-        const getProductsForCollection = async (
-          collectionId: string,
-          productLimit: number,
-        ): Promise<{ products: any[]; method: string; error?: string; attempts: any[] }> => {
-          // Method 1: ProductCollCollection.findCollectionProducts(collectionWid, limit)
-          //   - Same method web.whatsapp.com UI uses when clicking a collection
-          //   - Returns ProductModel[] for that collection
-          try {
-            if (wa.ProductCollCollection?.findCollectionProducts) {
-              const wid = makeWid(collectionId);
-              attempts.push({ method: 'ProductCollCollection.findCollectionProducts', wid: String(wid) });
-              const products: any[] = await wa.ProductCollCollection.findCollectionProducts(wid, productLimit);
-              attempts[attempts.length - 1].result = Array.isArray(products)
-                ? `${products.length} products`
-                : `non-array: ${typeof products}`;
-              if (Array.isArray(products) && products.length > 0) {
-                return {
-                  products: products.map(serializeProduct).filter(Boolean),
-                  method: 'ProductCollCollection.findCollectionProducts',
-                  attempts,
-                };
-              }
-            } else {
-              attempts.push({
-                method: 'ProductCollCollection.findCollectionProducts',
-                skipped: 'method not available',
+        // Step 1: Get collection metadata via WPP.catalog.getCollections
+        // This also populates CatalogStore and CatalogModel.collections
+        const collections: any[] = [];
+        try {
+          // productsCount=colLimit — request up to colLimit products per collection
+          const cols = await wpp.catalog.getCollections(userId, colLimit, colLimit);
+          if (Array.isArray(cols)) {
+            for (const c of cols) {
+              const a = c?.attributes || c;
+              if (!a?.id) continue;
+              collections.push({
+                id: String(a.id),
+                name: a.name || '',
+                products: [],
+                status: a.reviewStatus || a.status,
+                totalItemsCount: a.totalItemsCount || 0,
               });
             }
-          } catch (e: any) {
-            attempts.push({ method: 'ProductCollCollection.findCollectionProducts', error: e?.message });
+          }
+          diag.getCollectionsCount = collections.length;
+        } catch (error: any) {
+          diag.getCollectionsError = error?.message;
+          console.log('getCollections error:', error?.message);
+        }
+
+        if (collections.length === 0) {
+          return { collections: [], diag, error: 'No collections returned by getCollections' };
+        }
+
+        // Step 2: Get CatalogModel via CatalogStore.findQuery
+        // This gives us access to catalogModel.collections (ProductCollCollection instance)
+        let catalogModel: any = null;
+        let productCollCollection: any = null;
+        try {
+          const userWid = makeWid(userId);
+          const catalogModels = wa.CatalogStore?.findQuery
+            ? await wa.CatalogStore.findQuery(userWid)
+            : null;
+          if (Array.isArray(catalogModels) && catalogModels.length > 0) {
+            catalogModel = catalogModels[0];
+            diag.catalogModelKeys = Object.keys(catalogModel.attributes || catalogModel).slice(0, 30);
+            diag.catalogModelHasProductCollection = !!catalogModel.productCollection;
+            diag.catalogModelHasCollections = !!catalogModel.collections;
+            diag.catalogModelCollectionsType = typeof catalogModel.collections;
+            diag.catalogModelCollectionsIsArray = Array.isArray(catalogModel.collections);
+
+            // Step 3: Access catalogModel.collections → ProductCollCollection instance
+            if (catalogModel.collections) {
+              productCollCollection = catalogModel.collections;
+              const pccProto = Object.getPrototypeOf(productCollCollection) || {};
+              diag.productCollCollectionMethods = Object.getOwnPropertyNames(pccProto)
+                .concat(Object.getOwnPropertyNames(productCollCollection))
+                .filter((m: string) => typeof productCollCollection[m] === 'function' && !m.startsWith('_'));
+              diag.productCollCollectionHas = {
+                findCollectionProducts: typeof productCollCollection.findCollectionProducts === 'function',
+                getCollectionModels: typeof productCollCollection.getCollectionModels === 'function',
+                findCollectionsList: typeof productCollCollection.findCollectionsList === 'function',
+              };
+              // Also check if it's an array-like with length
+              diag.productCollCollectionLength = productCollCollection.length;
+            }
+          }
+        } catch (error: any) {
+          diag.catalogModelError = error?.message;
+          console.log('CatalogStore.findQuery error:', error?.message);
+        }
+
+        // Step 4: For each collection, try to get products
+        // Build a map: collectionId → products[]
+        const productsByCollectionId = new Map<string, any[]>();
+        const perCollectionDebug: any[] = [];
+
+        for (const col of collections) {
+          const colId = col.id;
+          const colName = col.name;
+          let products: any[] = [];
+          let method = 'none';
+          const attempts: any[] = [];
+
+          // Method A: productCollCollection.findCollectionProducts(collectionId, limit)
+          //   - This is the instance method on ProductCollCollection
+          //   - Same method web.whatsapp.com UI uses when clicking a collection
+          if (productCollCollection?.findCollectionProducts) {
+            try {
+              const colWid = makeWid(colId);
+              attempts.push({ method: 'findCollectionProducts', wid: String(colWid) });
+              const result: any[] = await productCollCollection.findCollectionProducts(colWid, colLimit);
+              attempts[attempts.length - 1].result = Array.isArray(result)
+                ? `${result.length} products`
+                : `non-array: ${typeof result}`;
+              if (Array.isArray(result) && result.length > 0) {
+                products = result.map(serializeProduct).filter(Boolean);
+                method = 'ProductCollCollection.findCollectionProducts';
+              }
+            } catch (e: any) {
+              attempts.push({ method: 'findCollectionProducts', error: e?.message });
+            }
           }
 
-          // Method 2: CatalogCollection.findCollectionMembership(catalogWid, productId, collectionWid?)
-          //   - Iterate ALL catalog products and check membership one-by-one
-          //   - Slow but works if catalog is already loaded in store
-          try {
-            if (wa.CatalogCollection?.findCollectionMembership) {
-              const catalogWid = makeWid(userId);
-              const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(catalogWid) : null;
+          // Method B: CatalogStore.findCollectionMembership(productId) per product
+          //   - findCollectionMembership returns which collection(s) a product belongs to
+          //   - We iterate all catalog products and check each one
+          //   - Note: CatalogStore IS the CatalogCollection instance (singleton)
+          if (products.length === 0 && wa.CatalogStore?.findCollectionMembership) {
+            try {
+              const userWid = makeWid(userId);
+              // Get all products from catalog store
+              let allProducts: any[] = [];
+              if (catalogModel?.productCollection?._index) {
+                allProducts = Object.values(catalogModel.productCollection._index);
+              }
               attempts.push({
-                method: 'CatalogCollection.findCollectionMembership',
-                catalogModels: Array.isArray(catalogModels) ? catalogModels.length : 'n/a',
+                method: 'findCollectionMembership',
+                totalProducts: allProducts.length,
               });
-              if (Array.isArray(catalogModels) && catalogModels.length > 0) {
-                const catalogModel = catalogModels[0];
-                const allProducts = catalogModel?.productCollection?._index
-                  ? Object.values(catalogModel.productCollection._index)
-                  : [];
-                attempts[attempts.length - 1].totalCatalogProducts = allProducts.length;
-                const memberProducts: any[] = [];
-                for (const p of allProducts) {
-                  if (memberProducts.length >= productLimit) break;
+              const memberProducts: any[] = [];
+              for (const p of allProducts) {
+                if (memberProducts.length >= colLimit) break;
+                try {
+                  const productModel = (p as any)?.attributes || p;
+                  const productId = productModel?.id;
+                  if (!productId) continue;
+                  // Try different argument signatures
+                  let membership: any;
                   try {
-                    const productModel = (p as any)?.attributes || p;
-                    const productId = productModel?.id;
-                    if (!productId) continue;
-                    // findCollectionMembership may take (collectionWid, productId)
-                    // or (catalogWid, productId, collectionWid) — try both signatures
-                    const collectionWid = makeWid(collectionId);
-                    let isMember: any;
+                    // Signature 1: (productId, catalogWid)
+                    membership = await wa.CatalogStore.findCollectionMembership(productId, userWid);
+                  } catch {
                     try {
-                      isMember = await wa.CatalogCollection.findCollectionMembership(collectionWid, productId);
+                      // Signature 2: (catalogWid, productId)
+                      membership = await wa.CatalogStore.findCollectionMembership(userWid, productId);
                     } catch {
-                      isMember = await wa.CatalogCollection.findCollectionMembership(
-                        catalogWid,
-                        productId,
-                        collectionWid,
-                      );
+                      // Signature 3: (collectionWid, productId)
+                      const colWid = makeWid(colId);
+                      membership = await wa.CatalogStore.findCollectionMembership(colWid, productId);
                     }
-                    if (isMember) {
+                  }
+                  // Check if membership indicates this product belongs to this collection
+                  // membership could be: collectionId string, array of collectionIds, or boolean
+                  if (membership) {
+                    const belongs =
+                      membership === colId ||
+                      membership?._serialized === colId ||
+                      membership?.id === colId ||
+                      (Array.isArray(membership) && membership.some((m: any) => 
+                        m === colId || m?._serialized === colId || m?.id === colId
+                      ));
+                    if (belongs) {
                       const plain = serializeProduct(productModel);
                       if (plain) memberProducts.push(plain);
                     }
-                  } catch {
-                    // skip individual product errors
                   }
-                }
-                attempts[attempts.length - 1].matchedProducts = memberProducts.length;
-                if (memberProducts.length > 0) {
-                  return {
-                    products: memberProducts,
-                    method: 'CatalogCollection.findCollectionMembership',
-                    attempts,
-                  };
+                } catch {
+                  // skip individual product errors
                 }
               }
-            } else {
-              attempts.push({ method: 'CatalogCollection.findCollectionMembership', skipped: 'method not available' });
+              attempts[attempts.length - 1].matchedProducts = memberProducts.length;
+              if (memberProducts.length > 0) {
+                products = memberProducts;
+                method = 'CatalogStore.findCollectionMembership';
+              }
+            } catch (e: any) {
+              attempts.push({ method: 'findCollectionMembership', error: e?.message });
             }
-          } catch (e: any) {
-            attempts.push({ method: 'CatalogCollection.findCollectionMembership', error: e?.message });
           }
 
-          // Method 3: Scan CatalogStore.products for collection-related fields
-          //   - Some WhatsApp versions store collectionId on ProductModel attributes
-          try {
-            const catalogWid = makeWid(userId);
-            const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(catalogWid) : null;
-            attempts.push({
-              method: 'CatalogStore.scanByCollectionId',
-              catalogModels: Array.isArray(catalogModels) ? catalogModels.length : 'n/a',
-            });
-            if (Array.isArray(catalogModels) && catalogModels.length > 0) {
-              const catalogModel = catalogModels[0];
-              const allProducts = catalogModel?.productCollection?._index
-                ? Object.values(catalogModel.productCollection._index)
-                : [];
-              attempts[attempts.length - 1].totalCatalogProducts = allProducts.length;
-              // Sample product to see what fields exist
+          // Method C: Scan catalogModel.productCollection for collectionId field
+          //   - Check if products have collectionId/collectionIds in their attributes
+          if (products.length === 0 && catalogModel?.productCollection?._index) {
+            try {
+              const allProducts = Object.values(catalogModel.productCollection._index);
+              // Log sample product keys for diagnostics
               if (allProducts.length > 0) {
                 const sample = (allProducts[0] as any)?.attributes || allProducts[0];
-                attempts[attempts.length - 1].sampleProductKeys = Object.keys(sample).slice(0, 30);
+                attempts.push({
+                  method: 'scanByCollectionId',
+                  totalProducts: allProducts.length,
+                  sampleProductKeys: Object.keys(sample).slice(0, 30),
+                });
               }
               const matching = allProducts
-                .map((p: any) => p?.attributes || p)
+                .map((p: any) => (p?.attributes || p))
                 .filter((p: any) => {
-                  // Check various possible field names
                   return (
-                    p?.collectionId === collectionId ||
-                    p?.collection_id === collectionId ||
-                    (Array.isArray(p?.collectionIds) && p.collectionIds.includes(collectionId)) ||
-                    (Array.isArray(p?.collection_ids) && p.collection_ids.includes(collectionId)) ||
-                    p?.collectionWid?._serialized === collectionId ||
-                    p?.collectionWid === collectionId
+                    String(p?.collectionId) === colId ||
+                    String(p?.collection_id) === colId ||
+                    (Array.isArray(p?.collectionIds) && p.collectionIds.some((c: any) => String(c) === colId)) ||
+                    (Array.isArray(p?.collection_ids) && p.collection_ids.some((c: any) => String(c) === colId)) ||
+                    String(p?.collectionWid?._serialized) === colId ||
+                    String(p?.collectionWid) === colId
                   );
                 })
                 .map(serializeProduct)
                 .filter(Boolean)
-                .slice(0, productLimit);
-              attempts[attempts.length - 1].matchedProducts = matching.length;
-              if (matching.length > 0) {
-                return {
-                  products: matching,
-                  method: 'CatalogStore.scanByCollectionId',
-                  attempts,
-                };
+                .slice(0, colLimit);
+              if (attempts[attempts.length - 1]) {
+                attempts[attempts.length - 1].matchedProducts = matching.length;
               }
+              if (matching.length > 0) {
+                products = matching;
+                method = 'CatalogStore.scanByCollectionId';
+              }
+            } catch (e: any) {
+              attempts.push({ method: 'scanByCollectionId', error: e?.message });
             }
-          } catch (e: any) {
-            attempts.push({ method: 'CatalogStore.scanByCollectionId', error: e?.message });
           }
 
-          return { products: [], method: 'none', error: 'All methods returned 0 products', attempts };
-        };
-
-        // Process each collection (sequentially to avoid rate limiting)
-        const results: any[] = [];
-        for (const col of collections) {
-          const r = await getProductsForCollection(col.id, limit);
-          results.push({
-            collectionId: col.id,
-            collectionName: col.name,
-            products: r.products,
-            method: r.method,
-            error: r.error,
-            attempts: r.attempts,
+          // Store products for this collection
+          productsByCollectionId.set(colId, products);
+          perCollectionDebug.push({
+            collectionId: colId,
+            collectionName: colName,
+            productCount: products.length,
+            method,
+            attempts: attempts.length > 0 ? attempts : undefined,
           });
-          // Small delay between collections
-          await new Promise((res) => setTimeout(res, 300));
         }
 
-        return { results, diag };
+        // Attach products to collections
+        for (const col of collections) {
+          const prods = productsByCollectionId.get(col.id) || [];
+          col.products = prods;
+          col.productsLength = prods.length;
+          col.totalItemsCount = prods.length;
+        }
+
+        const totalProducts = collections.reduce(
+          (sum: number, c: any) => sum + (Array.isArray(c.products) ? c.products.length : 0),
+          0,
+        );
+
+        return {
+          collections,
+          diag,
+          perCollectionDebug,
+          totalProducts,
+        };
       },
       wppUserId,
-      collectionIds,
-      productsPerCollection,
+      limit,
     );
 
     this.logger.log(
-      `[browser-fallback] Done. ${result?.results?.filter((r: any) => r.products?.length > 0).length || 0} ` +
-        `collections have products, total: ${result?.results?.reduce((s: number, r: any) => s + (r.products?.length || 0), 0) || 0}`,
+      `[browser] fetchCollections: ${result.collections.length} collections, ` +
+        `${result.totalProducts || 0} products mapped`,
     );
-    if (result?.diag) {
-      this.logger.log(`[browser-fallback] Diagnostic: ${JSON.stringify(result.diag).slice(0, 500)}`);
+    if (result.diag) {
+      this.logger.log(`[browser] Diagnostic: ${JSON.stringify(result.diag).slice(0, 500)}`);
     }
 
     return {
-      productsByCollectionId: result?.results || [],
-      diagnostic: result?.diag,
+      wuid: options.jid,
+      name: null,
+      numberExists: true,
+      isBusiness: true,
+      collectionsLength: result.collections.length,
+      collections: result.collections,
+      source: 'browser',
+      diagnostic: result.diag,
+      perCollectionDebug: result.perCollectionDebug,
+      totalProductsMapped: result.totalProducts || 0,
     };
   }
+
 
   async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {
     if (!this.config.enabled) {
