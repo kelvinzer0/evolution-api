@@ -807,6 +807,30 @@ export class BrowserCatalogService {
                 if (!Array.isArray(embeddedProducts)) {
                   embeddedProducts = (c as any)?.products;
                 }
+
+                // Diagnostic for first collection: inspect embedded products structure
+                if (collections.length === 0 && Array.isArray(embeddedProducts) && embeddedProducts.length > 0) {
+                  const firstProd = embeddedProducts[0];
+                  diag.firstEmbeddedProductType = typeof firstProd;
+                  diag.firstEmbeddedProductIsModel = firstProd?.constructor?.name || 'n/a';
+                  diag.firstEmbeddedProductKeys = firstProd
+                    ? Object.keys(firstProd.attributes || firstProd).slice(0, 20)
+                    : [];
+                  diag.firstEmbeddedProductHasId = !!(
+                    firstProd?.id ||
+                    firstProd?.attributes?.id
+                  );
+                  // Try serialize and check if it works
+                  const testSerialized = serializeProduct(firstProd);
+                  diag.firstEmbeddedProductSerializeResult = testSerialized
+                    ? `OK (${Object.keys(testSerialized).length} keys)`
+                    : 'null/failed';
+                  if (testSerialized) {
+                    diag.firstEmbeddedProductSampleId = testSerialized.id;
+                    diag.firstEmbeddedProductSampleName = testSerialized.name;
+                  }
+                }
+
                 const serializedProducts = Array.isArray(embeddedProducts)
                   ? embeddedProducts.map(serializeProduct).filter(Boolean)
                   : [];
