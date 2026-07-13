@@ -712,9 +712,7 @@ export class BrowserCatalogService {
           const attrs = p?.attributes || p;
           if (!attrs?.id) return null;
           try {
-            return JSON.parse(
-              JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
-            );
+            return JSON.parse(JSON.stringify(attrs, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)));
           } catch {
             return {
               id: attrs.id,
@@ -771,9 +769,7 @@ export class BrowserCatalogService {
         let productCollCollection: any = null;
         try {
           const userWid = makeWid(userId);
-          const catalogModels = wa.CatalogStore?.findQuery
-            ? await wa.CatalogStore.findQuery(userWid)
-            : null;
+          const catalogModels = wa.CatalogStore?.findQuery ? await wa.CatalogStore.findQuery(userWid) : null;
           if (Array.isArray(catalogModels) && catalogModels.length > 0) {
             catalogModel = catalogModels[0];
             diag.catalogModelKeys = Object.keys(catalogModel.attributes || catalogModel).slice(0, 30);
@@ -880,9 +876,8 @@ export class BrowserCatalogService {
                       membership === colId ||
                       membership?._serialized === colId ||
                       membership?.id === colId ||
-                      (Array.isArray(membership) && membership.some((m: any) => 
-                        m === colId || m?._serialized === colId || m?.id === colId
-                      ));
+                      (Array.isArray(membership) &&
+                        membership.some((m: any) => m === colId || m?._serialized === colId || m?.id === colId));
                     if (belongs) {
                       const plain = serializeProduct(productModel);
                       if (plain) memberProducts.push(plain);
@@ -917,7 +912,7 @@ export class BrowserCatalogService {
                 });
               }
               const matching = allProducts
-                .map((p: any) => (p?.attributes || p))
+                .map((p: any) => p?.attributes || p)
                 .filter((p: any) => {
                   return (
                     String(p?.collectionId) === colId ||
@@ -999,7 +994,6 @@ export class BrowserCatalogService {
       totalProductsMapped: result.totalProducts || 0,
     };
   }
-
 
   async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {
     if (!this.config.enabled) {
