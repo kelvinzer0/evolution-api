@@ -1282,36 +1282,68 @@ export class BrowserCatalogService {
           // stat failed — proceed with download
         }
 
-        // Download image
-        try {
-          const response = await axios.get(imageUrl, {
-            responseType: 'arraybuffer',
-            timeout: 30000,
-            maxRedirects: 5,
-          });
+        // Download image — retry up to 3 times with different CDN URL keys
+        // WhatsApp CDN URLs can expire or fail; try 'full', then 'original',
+        // then 'requested' if the first one fails.
+        let downloadSuccess = false;
+        const cdnUrlList = Array.isArray(cdnUrls)
+          ? [...cdnUrls]
+              .sort((a: any, b: any) => {
+                const priority = (k: string) => (k === 'full' ? 0 : k === 'original' ? 1 : k === 'requested' ? 3 : 2);
+                return priority(a?.key) - priority(b?.key);
+              })
+              .filter((img: any) => img?.value)
+          : [];
 
-          const buffer = Buffer.from(response.data);
-          if (buffer.length < 100) {
-            // Too small — probably error page
-            failedCount++;
+        for (const cdnEntry of cdnUrlList) {
+          const tryUrl = cdnEntry.value;
+          try {
+            const response = await axios.get(tryUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000,
+              maxRedirects: 5,
+            });
+
+            const buffer = Buffer.from(response.data);
+            if (buffer.length < 1000) {
+              // Too small — probably error page, try next URL
+              continue;
+            }
+
+            // Write to file
+            writeFileSync(localPath, buffer);
+
+            // Replace CDN URLs with local URL
+            product.image_cdn_urls = [{ key: 'local', value: localUrl }];
+            if (product.additional_image_cdn_urls) {
+              product.additional_image_cdn_urls = [];
+            }
+
+            downloadedCount++;
+            downloadSuccess = true;
+            break; // Success, no need to try other URLs
+          } catch {
+            // This URL failed, try next one
             continue;
           }
+        }
 
-          // Write to file
-          writeFileSync(localPath, buffer);
-
-          // Replace CDN URLs with local URL
-          product.image_cdn_urls = [{ key: 'local', value: localUrl }];
-          // Clear additional images (they'd need separate download logic)
+        if (!downloadSuccess) {
+          // All CDN URLs failed — delete stale local file if exists
+          try {
+            if (existsSync(localPath)) {
+              unlinkSync(localPath);
+            }
+          } catch {
+            // ignore
+          }
+          // Mark product as having no image (empty local URL)
+          product.image_cdn_urls = [];
           if (product.additional_image_cdn_urls) {
             product.additional_image_cdn_urls = [];
           }
-
-          downloadedCount++;
-        } catch (err) {
-          this.logger.warn(`[browser] Failed to download image for product ${productId}: ${(err as Error)?.message}`);
           failedCount++;
-          // Keep original CDN URL as fallback
+          this.logger.warn(`[browser] All image URLs failed for product ${productId}`);
         }
       }
     }
