@@ -37,21 +37,9 @@ import {
 } from './catalog-browser.types';
 
 // Watermark helper for catalog images (warunglakku.com branding).
-// Loaded lazily on first call via dynamic import() to satisfy ESLint rules
-// (no-require-imports + import/first).
-// See Docker/watermark/watermark-helper.js for watermark specs.
-let _applyWatermark: ((buf: Buffer) => Promise<Buffer>) | null | undefined;
-async function getApplyWatermark(): Promise<((buf: Buffer) => Promise<Buffer>) | null> {
-  if (_applyWatermark !== undefined) return _applyWatermark;
-  try {
-    const wm = await import('../../../../Docker/watermark/watermark-helper');
-    _applyWatermark = typeof wm?.applyWatermark === 'function' ? wm.applyWatermark : null;
-  } catch {
-    // Helper not available (e.g., during unit test) — image sync will skip watermark
-    _applyWatermark = null;
-  }
-  return _applyWatermark;
-}
+// Applies text watermark + EXIF metadata to downloaded catalog images.
+// See src/services/watermark-helper.ts for full specs.
+import { applyWatermark } from '../../../../services/watermark-helper';
 
 // Per-instance client state
 interface InstanceClientState {
@@ -1330,7 +1318,6 @@ export class BrowserCatalogService {
             // Apply watermark before writing to disk
             // Watermark: bottom-right "warunglakku.com", 14pt Poppins Bold, 40% opacity, EXIF
             let finalBuffer = buffer;
-            const applyWatermark = await getApplyWatermark();
             if (applyWatermark) {
               try {
                 finalBuffer = await applyWatermark(buffer);
