@@ -20,6 +20,7 @@
  *   bedones-whatsapp/apps/whatsapp-connector/src/catalog/catalog.service.ts
  */
 
+import { applyWatermark } from '../../../../services/watermark-helper';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException } from '@exceptions';
@@ -39,7 +40,6 @@ import {
 // Watermark helper for catalog images (warunglakku.com branding).
 // Applies text watermark + EXIF metadata to downloaded catalog images.
 // See src/services/watermark-helper.ts for full specs.
-import { applyWatermark } from '../../../../services/watermark-helper';
 
 // Per-instance client state
 interface InstanceClientState {

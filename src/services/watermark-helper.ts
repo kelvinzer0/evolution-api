@@ -53,10 +53,7 @@ export async function applyWatermark(imageBuffer: Buffer): Promise<Buffer> {
     // Spec: 14pt at standard 96 DPI = ~18.67px
     // Scale up for larger images (cap at 3x base size)
     const baseFontSize = FONT_SIZE * (96 / 72); // 14pt → ~18.67px at 96 DPI
-    const scaledFontSize = Math.max(
-      baseFontSize,
-      Math.min(baseFontSize * 3, width / 22),
-    );
+    const scaledFontSize = Math.max(baseFontSize, Math.min(baseFontSize * 3, width / 22));
 
     // Estimate text width for Poppins Bold (~0.55em per char average)
     const textWidth = WATERMARK_TEXT.length * scaledFontSize * 0.55;
@@ -65,7 +62,7 @@ export async function applyWatermark(imageBuffer: Buffer): Promise<Buffer> {
     // Reason: text-width estimate (0.55em/char) is approximate; actual Poppins Bold
     // is wider. Shifting text 10% of width to the left ensures the right edge
     // of the text is fully visible (not clipped by image edge).
-    const rightOffset = width * 0.10; // 10% of image width
+    const rightOffset = width * 0.1; // 10% of image width
     const bottomMargin = Math.max(15, height * 0.03);
     // x: left edge of text (so right edge of text = width - rightOffset)
     const x = width - textWidth - rightOffset;
