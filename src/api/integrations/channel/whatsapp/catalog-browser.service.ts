@@ -28,23 +28,6 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writ
 import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
-// Watermark helper for catalog images (warunglakku.com branding).
-// Loaded lazily on first call (avoids ESLint no-require-imports + import/first errors).
-// See Docker/watermark/watermark-helper.js for watermark specs.
-let _applyWatermark: ((buf: Buffer) => Promise<Buffer>) | null | undefined;
-async function getApplyWatermark(): Promise<((buf: Buffer) => Promise<Buffer>) | null> {
-  if (_applyWatermark !== undefined) return _applyWatermark;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const wm = require('../../../../Docker/watermark/watermark-helper');
-    _applyWatermark = typeof wm?.applyWatermark === 'function' ? wm.applyWatermark : null;
-  } catch {
-    // Helper not available (e.g., during unit test) — image sync will skip watermark
-    _applyWatermark = null;
-  }
-  return _applyWatermark;
-}
-
 import {
   BrowserCatalogConfig,
   BrowserCatalogOptions,
@@ -52,6 +35,23 @@ import {
   BrowserCollectionsOptions,
   BrowserCollectionsResult,
 } from './catalog-browser.types';
+
+// Watermark helper for catalog images (warunglakku.com branding).
+// Loaded lazily on first call via dynamic import() to satisfy ESLint rules
+// (no-require-imports + import/first).
+// See Docker/watermark/watermark-helper.js for watermark specs.
+let _applyWatermark: ((buf: Buffer) => Promise<Buffer>) | null | undefined;
+async function getApplyWatermark(): Promise<((buf: Buffer) => Promise<Buffer>) | null> {
+  if (_applyWatermark !== undefined) return _applyWatermark;
+  try {
+    const wm = await import('../../../../Docker/watermark/watermark-helper');
+    _applyWatermark = typeof wm?.applyWatermark === 'function' ? wm.applyWatermark : null;
+  } catch {
+    // Helper not available (e.g., during unit test) — image sync will skip watermark
+    _applyWatermark = null;
+  }
+  return _applyWatermark;
+}
 
 // Per-instance client state
 interface InstanceClientState {
