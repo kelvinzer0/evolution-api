@@ -29,17 +29,20 @@ import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
 // Watermark helper for catalog images (warunglakku.com branding).
-// Loaded once at module init; see Docker/watermark/watermark-helper.js for specs.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-let applyWatermark: ((buf: Buffer) => Promise<Buffer>) | null = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const wm = require('../../../../Docker/watermark/watermark-helper');
-  if (typeof wm?.applyWatermark === 'function') {
-    applyWatermark = wm.applyWatermark;
+// Loaded lazily on first call (avoids ESLint no-require-imports + import/first errors).
+// See Docker/watermark/watermark-helper.js for watermark specs.
+let _applyWatermark: ((buf: Buffer) => Promise<Buffer>) | null | undefined;
+async function getApplyWatermark(): Promise<((buf: Buffer) => Promise<Buffer>) | null> {
+  if (_applyWatermark !== undefined) return _applyWatermark;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const wm = require('../../../../Docker/watermark/watermark-helper');
+    _applyWatermark = typeof wm?.applyWatermark === 'function' ? wm.applyWatermark : null;
+  } catch {
+    // Helper not available (e.g., during unit test) — image sync will skip watermark
+    _applyWatermark = null;
   }
-} catch {
-  // Helper not available (e.g., during unit test) — image sync will skip watermark
+  return _applyWatermark;
 }
 
 import {
@@ -1327,6 +1330,7 @@ export class BrowserCatalogService {
             // Apply watermark before writing to disk
             // Watermark: bottom-right "warunglakku.com", 14pt Poppins Bold, 40% opacity, EXIF
             let finalBuffer = buffer;
+            const applyWatermark = await getApplyWatermark();
             if (applyWatermark) {
               try {
                 finalBuffer = await applyWatermark(buffer);
