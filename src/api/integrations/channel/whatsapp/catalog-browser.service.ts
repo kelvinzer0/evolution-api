@@ -28,6 +28,20 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writ
 import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
+// Watermark helper for catalog images (warunglakku.com branding).
+// Loaded once at module init; see Docker/watermark/watermark-helper.js for specs.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+let applyWatermark: ((buf: Buffer) => Promise<Buffer>) | null = null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const wm = require('../../../../Docker/watermark/watermark-helper');
+  if (typeof wm?.applyWatermark === 'function') {
+    applyWatermark = wm.applyWatermark;
+  }
+} catch {
+  // Helper not available (e.g., during unit test) — image sync will skip watermark
+}
+
 import {
   BrowserCatalogConfig,
   BrowserCatalogOptions,
@@ -1313,14 +1327,13 @@ export class BrowserCatalogService {
             // Apply watermark before writing to disk
             // Watermark: bottom-right "warunglakku.com", 14pt Poppins Bold, 40% opacity, EXIF
             let finalBuffer = buffer;
-            try {
-              const watermarkHelper = require('../../../../Docker/watermark/watermark-helper');
-              if (typeof watermarkHelper.applyWatermark === 'function') {
-                finalBuffer = await watermarkHelper.applyWatermark(buffer);
+            if (applyWatermark) {
+              try {
+                finalBuffer = await applyWatermark(buffer);
+              } catch (wmErr) {
+                // Watermark failed — log and fall back to original buffer
+                this.logger?.warn?.(`[catalog-browser] Watermark failed for ${productId}: ${wmErr?.message}`);
               }
-            } catch (wmErr) {
-              // Watermark failed — log and fall back to original buffer
-              this.logger?.warn?.(`[catalog-browser] Watermark failed for ${productId}: ${wmErr?.message}`);
             }
 
             // Write to file
