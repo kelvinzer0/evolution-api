@@ -20,7 +20,6 @@
  *   bedones-whatsapp/apps/whatsapp-connector/src/catalog/catalog.service.ts
  */
 
-import { applyWatermark } from '../../../../services/watermark-helper';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException } from '@exceptions';
@@ -29,6 +28,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writ
 import { join } from 'path';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
+import { applyWatermark } from '../../../../services/watermark-helper';
 import {
   BrowserCatalogConfig,
   BrowserCatalogOptions,
