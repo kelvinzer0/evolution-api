@@ -1310,8 +1310,21 @@ export class BrowserCatalogService {
               continue;
             }
 
+            // Apply watermark before writing to disk
+            // Watermark: bottom-right "warunglakku.com", 14pt Poppins Bold, 40% opacity, EXIF
+            let finalBuffer = buffer;
+            try {
+              const watermarkHelper = require('../../../../Docker/watermark/watermark-helper');
+              if (typeof watermarkHelper.applyWatermark === 'function') {
+                finalBuffer = await watermarkHelper.applyWatermark(buffer);
+              }
+            } catch (wmErr) {
+              // Watermark failed — log and fall back to original buffer
+              this.logger?.warn?.(`[catalog-browser] Watermark failed for ${productId}: ${wmErr?.message}`);
+            }
+
             // Write to file
-            writeFileSync(localPath, buffer);
+            writeFileSync(localPath, finalBuffer);
 
             // Replace CDN URLs with local URL
             product.image_cdn_urls = [{ key: 'local', value: localUrl }];

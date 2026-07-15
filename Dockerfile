@@ -41,6 +41,13 @@ RUN apk update && \
     apk add --no-cache tzdata ffmpeg bash openssl \
     chromium nss freetype harfbuzz ttf-freefont font-noto-emoji
 
+# Install Poppins Bold font for watermark rendering (sharp/librsvg uses fontconfig)
+# Source: Google Fonts (OFL license) — https://fonts.google.com/specimen/Poppins
+RUN mkdir -p /usr/share/fonts/truetype/poppins && \
+    wget -q -O /usr/share/fonts/truetype/poppins/Poppins-Bold.ttf \
+      "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf" && \
+    fc-cache -f
+
 ENV TZ=America/Sao_Paulo
 ENV DOCKER_ENV=true
 
