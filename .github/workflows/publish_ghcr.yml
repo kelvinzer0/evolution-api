@@ -28,11 +28,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Sync package-lock.json
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npm install --package-lock-only --prefer-offline || npm install --package-lock-only
+      
+      - name: Sync package-lock.json
+        run: npm install --package-lock-only || true
       - name: Commit lockfile if changed
         run: |
           if [ -n "$(git diff package-lock.json)" ]; then
