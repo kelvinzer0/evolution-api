@@ -3,6 +3,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchOrderDetailDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -261,6 +262,22 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.OK).json(response);
+      })
+      // Order detail via browser provider (WPP.order.get)
+      .post(this.routerPath('fetchOrderDetail'), ...guards, async (req, res) => {
+        try {
+          const response = await this.dataValidate<FetchOrderDetailDto>({
+            request: req,
+            schema: null,
+            ClassRef: FetchOrderDetailDto,
+            execute: (instance, data) => chatController.fetchOrderDetail(instance, data),
+          });
+
+          return res.status(HttpStatus.OK).json(response);
+        } catch (error) {
+          console.log(error);
+          return res.status(HttpStatus.BAD_REQUEST).json(error);
+        }
       })
       .get(this.routerPath('fetchPrivacySettings'), ...guards, async (req, res) => {
         const response = await this.dataValidate<InstanceDto>({

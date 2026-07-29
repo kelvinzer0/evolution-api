@@ -127,3 +127,10 @@ export class BlockUserDto {
   number: string;
   status: 'block' | 'unblock';
 }
+
+export class FetchOrderDetailDto {
+  /** WhatsApp message ID (the key.id from the orderMessage) */
+  messageId: string;
+  /** The order ID from orderMessage.orderId (optional, for logging) */
+  orderId?: string;
+}

@@ -104,6 +104,20 @@ export class BrowserCatalogService {
     }
     return svc.fetchCollections(options);
   }
+  static async fetchOrderDetailOrThrow(options: {
+    instanceName: string;
+    messageId: string;
+    orderId?: string;
+  }): Promise<any> {
+    const svc = BrowserCatalogService.getInstance();
+    if (!svc) {
+      throw new BadRequestException(
+        'Browser catalog service is not initialized. Set CATALOG_BROWSER_ENABLED=true to enable.',
+      );
+    }
+    return svc.fetchOrderDetail(options);
+  }
+
 
   private loadConfig(): BrowserCatalogConfig {
     const enabled = (process.env.CATALOG_BROWSER_ENABLED || 'false').toLowerCase() === 'true';
@@ -1370,6 +1384,105 @@ export class BrowserCatalogService {
     );
 
     return collections;
+  }
+
+  /**
+   * Public entry: fetch full order detail via WPP.order.get().
+   *
+   * Baileys protocol-level orderMessage.items[] is always empty because
+   * WhatsApp does not include per-item details in the protocol stanza.
+   * The WhatsApp Web UI fetches these on-demand via a separate IQ query,
+   * which WPP.order.get() wraps.
+   *
+   * Returns OrderModel with full products[] array containing:
+   *   - id: product catalog ID
+   *   - name: product name
+   *   - quantity: quantity ordered
+   *   - amount: price per item
+   *   - isCustomItem: true if non-catalog item
+   */
+  async fetchOrderDetail(options: {
+    instanceName: string;
+    messageId: string;
+    orderId?: string;
+  }): Promise<any> {
+    if (!this.config.enabled) {
+      throw new BadRequestException('Browser catalog service is disabled. Set CATALOG_BROWSER_ENABLED=true to enable.');
+    }
+
+    const { instanceName, messageId, orderId } = options;
+    this.logger.log(\`[browser] fetchOrderDetail instance=${instanceName} messageId=${messageId} orderId=${orderId || 'N/A'}\`);
+
+    const state = await this.getReadyClient(instanceName);
+
+    if (!state.ready || state.qrCode) {
+      throw new BadRequestException(
+        'Browser client is not authenticated yet. Please scan QR code first.',
+      );
+    }
+
+    const page = await state.client.pupPage;
+    if (!page) {
+      throw new BadRequestException('WhatsApp Web page not available');
+    }
+
+    await this.injectWaJs(page);
+
+    try {
+      await page.setDefaultTimeout(60000);
+    } catch {
+      // ignore
+    }
+
+    const result = await page.evaluate(
+      async (msgId: string): Promise<any> => {
+        const wpp = (window as any).WPP;
+        if (!wpp) return { error: 'WPP not available' };
+
+        // METHOD 1 (PRIMARY): WPP.order.get() — fetches full order from WhatsApp server
+        if (wpp.order?.get) {
+          try {
+            const orderModel = await wpp.order.get(msgId);
+            if (orderModel) {
+              const serialized = JSON.parse(
+                JSON.stringify(orderModel, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+              );
+              return { source: 'WPP.order.get', order: serialized };
+            }
+          } catch (e: any) {
+            console.log('WPP.order.get error:', e?.message);
+          }
+        }
+
+        // METHOD 2 (FALLBACK): Get message from MsgStore via WPP.chat.getMessageById
+        if (wpp.chat?.getMessageById) {
+          try {
+            const msg = await wpp.chat.getMessageById(msgId);
+            if (msg) {
+              const serialized = JSON.parse(
+                JSON.stringify(msg, (_k: string, v: any) => (typeof v === 'function' ? undefined : v)),
+              );
+              return { source: 'WPP.chat.getMessageById', message: serialized };
+            }
+          } catch (e: any) {
+            console.log('WPP.chat.getMessageById error:', e?.message);
+          }
+        }
+
+        return { error: 'All methods failed: WPP.order.get and WPP.chat.getMessageById' };
+      },
+      messageId,
+    );
+
+    if (!result || result.error) {
+      this.logger.warn(\`[browser] fetchOrderDetail failed: ${result?.error || 'no result'}\`);
+      throw new BadRequestException(
+        result?.error || 'Order detail fetch failed. The message may not be an order, or the chat has not been loaded in WhatsApp Web.',
+      );
+    }
+
+    this.logger.log(\`[browser] fetchOrderDetail success via ${result.source}\`);
+    return result;
   }
 
   async requestPairingCode(instanceName: string, phoneNumber: string): Promise<string> {

@@ -2,6 +2,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchOrderDetailDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -17,6 +18,7 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { BrowserCatalogService } from '@api/integrations/channel/whatsapp/catalog-browser.service';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
 
 export class ChatController {
@@ -112,5 +114,23 @@ export class ChatController {
 
   public async blockUser({ instanceName }: InstanceDto, data: BlockUserDto) {
     return await this.waMonitor.waInstances[instanceName].blockUser(data);
+  }
+
+  /**
+   * Fetch full order detail (with per-item prices/quantities) via
+   * WPP.order.get() in a headless WhatsApp Web browser.
+   *
+   * Baileys' orderMessage.items[] is always empty because WhatsApp
+   * only sends orderTitle (comma-separated names) + totalAmount1000
+   * in the protocol stanza. This endpoint uses the browser provider to
+   * call WPP.order.get(messageId) which makes a separate IQ query to
+   * WhatsApp servers and returns the full OrderModel with products[].
+   */
+  public async fetchOrderDetail({ instanceName }: InstanceDto, data: FetchOrderDetailDto) {
+    return await BrowserCatalogService.fetchOrderDetailOrThrow({
+      instanceName,
+      messageId: data.messageId,
+      orderId: data.orderId,
+    });
   }
 }
