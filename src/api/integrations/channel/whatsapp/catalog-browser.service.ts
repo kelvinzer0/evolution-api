@@ -1411,7 +1411,7 @@ export class BrowserCatalogService {
     }
 
     const { instanceName, messageId, orderId } = options;
-    this.logger.log(\`[browser] fetchOrderDetail instance=${instanceName} messageId=${messageId} orderId=${orderId || 'N/A'}\`);
+    this.logger.log(`[browser] fetchOrderDetail instance=${instanceName} messageId=${messageId} orderId=${orderId || 'N/A'}`);
 
     const state = await this.getReadyClient(instanceName);
 
@@ -1475,13 +1475,13 @@ export class BrowserCatalogService {
     );
 
     if (!result || result.error) {
-      this.logger.warn(\`[browser] fetchOrderDetail failed: ${result?.error || 'no result'}\`);
+      this.logger.warn(`[browser] fetchOrderDetail failed: ${result?.error || 'no result'}`);
       throw new BadRequestException(
         result?.error || 'Order detail fetch failed. The message may not be an order, or the chat has not been loaded in WhatsApp Web.',
       );
     }
 
-    this.logger.log(\`[browser] fetchOrderDetail success via ${result.source}\`);
+    this.logger.log(`[browser] fetchOrderDetail success via ${result.source}`);
     return result;
   }
 
